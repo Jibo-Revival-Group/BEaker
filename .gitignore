@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Pack staging (make_package hardlink/temp tree)
+.jibo-ota-tmp/
+
+# Built OTA packages (repack with pack_beam_skills.py)
+updates/packages/
+
+# Runtime state written by the server
+updates/backups/
+updates/robots/
+updates/media/
+updates/keys/
+*.partial
+
+# Local / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

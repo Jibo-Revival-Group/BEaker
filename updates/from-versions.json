@@ -1,0 +1,9 @@
+{
+  "os": "13.0.0",
+  "services": "13.0.0",
+  "@be/be": "10.0.18",
+  "oobe-config": "9.0.0",
+  "jibo-diagnostics": "6.0.18",
+  "jibo-tbd": "BEam.1.1.0",
+  "fin-goods-test": "0.0.0"
+}

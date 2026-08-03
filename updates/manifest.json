@@ -1,0 +1,102 @@
+[
+  {
+    "_id": "beam-be-eau",
+    "fromVersion": "10.0.18",
+    "toVersion": "13.0.0",
+    "subsystem": "@be/be",
+    "filter": "eau",
+    "changes": "BEam @be/be (13.0.0)",
+    "package": "beam-be.tar",
+    "dependencies": {}
+  },
+  {
+    "_id": "beam-be-fcs",
+    "fromVersion": "10.0.18",
+    "toVersion": "13.0.0",
+    "subsystem": "@be/be",
+    "filter": "fcs",
+    "changes": "BEam @be/be (13.0.0)",
+    "package": "beam-be.tar",
+    "dependencies": {}
+  },
+  {
+    "_id": "beam-oobe-config-eau",
+    "fromVersion": "9.0.0",
+    "toVersion": "9.0.0+beam.1",
+    "subsystem": "oobe-config",
+    "filter": "eau",
+    "changes": "BEam oobe-config (9.0.0)",
+    "package": "beam-oobe-config.tar",
+    "dependencies": {}
+  },
+  {
+    "_id": "beam-oobe-config-fcs",
+    "fromVersion": "9.0.0",
+    "toVersion": "9.0.0+beam.1",
+    "subsystem": "oobe-config",
+    "filter": "fcs",
+    "changes": "BEam oobe-config (9.0.0)",
+    "package": "beam-oobe-config.tar",
+    "dependencies": {}
+  },
+  {
+    "_id": "beam-jibo-diagnostics-eau",
+    "fromVersion": "6.0.18",
+    "toVersion": "3.1.2",
+    "subsystem": "jibo-diagnostics",
+    "filter": "eau",
+    "changes": "BEam jibo-diagnostics (3.1.2)",
+    "package": "beam-jibo-diagnostics.tar",
+    "dependencies": {}
+  },
+  {
+    "_id": "beam-jibo-diagnostics-fcs",
+    "fromVersion": "6.0.18",
+    "toVersion": "3.1.2",
+    "subsystem": "jibo-diagnostics",
+    "filter": "fcs",
+    "changes": "BEam jibo-diagnostics (3.1.2)",
+    "package": "beam-jibo-diagnostics.tar",
+    "dependencies": {}
+  },
+  {
+    "_id": "beam-jibo-tbd-eau",
+    "fromVersion": "BEam.1.1.0",
+    "toVersion": "3.0.0.b",
+    "subsystem": "jibo-tbd",
+    "filter": "eau",
+    "changes": "BEam jibo-tbd (3.0.0.b)",
+    "package": "beam-jibo-tbd.tar",
+    "dependencies": {}
+  },
+  {
+    "_id": "beam-jibo-tbd-fcs",
+    "fromVersion": "BEam.1.1.0",
+    "toVersion": "3.0.0.b",
+    "subsystem": "jibo-tbd",
+    "filter": "fcs",
+    "changes": "BEam jibo-tbd (3.0.0.b)",
+    "package": "beam-jibo-tbd.tar",
+    "dependencies": {}
+  },
+  {
+    "_id": "beam-fin-goods-test-eau",
+    "fromVersion": "0.0.0",
+    "toVersion": "3.0.0",
+    "subsystem": "fin-goods-test",
+    "filter": "eau",
+    "changes": "BEam fin-goods-test (3.0.0)",
+    "package": "beam-fin-goods-test.tar",
+    "dependencies": {}
+  },
+  {
+    "_id": "beam-fin-goods-test-fcs",
+    "fromVersion": "0.0.0",
+    "toVersion": "3.0.0",
+    "subsystem": "fin-goods-test",
+    "filter": "fcs",
+    "changes": "BEam fin-goods-test (3.0.0)",
+    "package": "beam-fin-goods-test.tar",
+    "dependencies": {}
+  }
+]
