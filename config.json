@@ -1,7 +1,7 @@
 {
   "host": "0.0.0.0",
   "port": 8042,
-  "public_base_url": "http://192.168.7.105:8042",
+  "public_base_url": "http://joap.5x1.com:80",
   "require_auth": false,
   "region": "api",
   "service": "update",

@@ -897,8 +897,32 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/reload":
+            # Re-read config so public_base_url (and similar) take effect without
+            # a full process restart.
+            try:
+                fresh = load_json(DEFAULT_CONFIG)
+                for key in (
+                    "public_base_url",
+                    "require_auth",
+                    "region",
+                    "service",
+                    "account_id",
+                    "accounts",
+                ):
+                    if key in fresh:
+                        self.config[key] = fresh[key]
+            except Exception as exc:
+                self._send_json(500, {"error": f"config reload failed: {exc}"})
+                return
             self.catalog.reload()
-            self._send_json(200, {"reloaded": True, "updates": len(self.catalog.updates)})
+            self._send_json(
+                200,
+                {
+                    "reloaded": True,
+                    "updates": len(self.catalog.updates),
+                    "public_base_url": self.config["public_base_url"],
+                },
+            )
             return
 
         if path.startswith("/packages/"):
