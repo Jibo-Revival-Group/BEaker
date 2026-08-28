@@ -9,7 +9,8 @@ BEaker you get zero extra capability from using the BEam update script, and it m
 troubleshooting on the Discord quite difficult as we are unaware as to what version
 of BEam or other Jibo Software you may be running. Another reason you shouldn't self-host
 BEaker is that it has many environment specific code, that is specifically so that it will
-run well on the 5x1 servers.
+run well on the 5x1 servers. There may also be a few security flaws, idk, I don't really
+care.
 
 ## Compatibility no-ops
 
