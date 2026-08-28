@@ -29,6 +29,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from server import reload_allowed
+
 ROOT = Path(__file__).resolve().parent
 ROBOT = "selftest-robot"
 FAILURES: list[str] = []
@@ -155,6 +157,14 @@ def main() -> int:
                 print("server did not start")
                 return 1
             run_checks(base)
+            check(
+                "backup payload is not persisted",
+                not (updates / "backups" / ROBOT).exists(),
+            )
+            check(
+                "media payload is not persisted",
+                not (updates / "media" / ROBOT).exists(),
+            )
         finally:
             proc.terminate()
             out = proc.communicate(timeout=10)[0]
@@ -280,11 +290,15 @@ def run_checks(base: str) -> None:
     status, items = call(base, "Backup_20170222.List", {"loopId": loop_id})
     check("rejected upload is not listed", len(items or []) == 1 and items[0]["etag"] == etag2)
 
-    # --- jibo-system-restore -------------------------------------------------
+    # The no-op server advertises the upload for protocol compatibility, but
+    # deliberately has no payload for restore to download.
     url = items[0]["location"]["url"]
-    with urllib.request.urlopen(url) as resp:
-        body = resp.read()
-    check("location.url downloads the newest blob", body == b"newer" * 1000, str(len(body)))
+    try:
+        urllib.request.urlopen(url)
+    except urllib.error.HTTPError as exc:
+        check("discarded backup is not downloadable", exc.code == 404, str(exc))
+    else:
+        check("discarded backup is not downloadable", False, "unexpected 200 response")
     check("location.url is http for a plain OTA host", url.startswith("http://"), url)
 
     # Backups from another loop are never offered: they were encrypted with a
@@ -320,13 +334,22 @@ def run_checks(base: str) -> None:
     check("Media.Create keeps x-meta-* headers", (rec.get("meta") or {}).get("width") == "640",
           str(rec.get("meta")))
     status, got = call(base, "Media_20160725.Get", {"paths": ["selftest-photo"]})
-    check("Media.Get returns a list", isinstance(got, list) and len(got) == 1, str(got))
+    check("Media.Get is a no-op", status == 200 and got == [], str(got))
     status, listed = call(base, "Media_20160725.List", {"loopIds": [loop_id]})
-    check("Media.List returns a list", isinstance(listed, list) and len(listed) == 1, str(listed))
+    check("Media.List is a no-op", status == 200 and listed == [], str(listed))
     status, removed = call(base, "Media_20160725.Remove", {"paths": ["selftest-photo"]})
-    check("Media.Remove reports isDeleted",
-          isinstance(removed, list) and removed and removed[0].get("isDeleted") is True,
-          str(removed))
+    check("Media.Remove is a no-op", status == 200 and removed == [], str(removed))
+
+    # --- reload allowlist ----------------------------------------------------
+    check("reload allows other 192.168 clients", reload_allowed("192.168.1.1"))
+    check("reload denies the tunnel peer", not reload_allowed("192.168.7.55"))
+    check("reload denies non-LAN clients", not reload_allowed("203.0.113.10"))
+    try:
+        urllib.request.urlopen(base + "/reload")
+    except urllib.error.HTTPError as exc:
+        check("reload rejects the local non-LAN test peer", exc.code == 403, str(exc))
+    else:
+        check("reload rejects the local non-LAN test peer", False, "unexpected 200 response")
 
     # --- key (sts) -----------------------------------------------------------
     status, should = call(base, "Key_20160201.ShouldCreate", {"loopId": loop_id})

@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import ipaddress
 import json
 import random
 import re
@@ -50,6 +51,8 @@ KEYS_DIR = ROOT / "updates" / "keys"
 # Same trick as srv-backup-ws: lexicographic latest-first object names.
 _BACKUP_MAGIC = 9999999999999
 STREAM_CHUNK = 1024 * 1024
+RELOAD_NETWORK = ipaddress.ip_network("192.168.0.0/16")
+RELOAD_DENY = ipaddress.ip_address("192.168.7.55")
 
 # SigV4 credential scope service names, taken from endpointPrefix in the
 # robot's own jibo-server-client/apis/*.min.json. Loop really is capitalized.
@@ -108,6 +111,15 @@ def sha1_file(path: Path) -> str:
 
 def safe_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_") or "unknown"
+
+
+def reload_allowed(peer_ip: str) -> bool:
+    """Allow LAN reloads except the tunnel peer."""
+    try:
+        address = ipaddress.ip_address(peer_ip)
+    except ValueError:
+        return False
+    return address in RELOAD_NETWORK and address != RELOAD_DENY
 
 
 def extract_access_key(headers: dict[str, str]) -> str | None:
@@ -230,20 +242,17 @@ class IncompleteUpload(Exception):
 
 
 class BackupStore:
-    """Local stand-in for backup-ws + upload URLs, isolated per robot."""
+    """Protocol-compatible backup stand-in that discards uploaded blobs."""
 
     def __init__(self, config: dict[str, Any], robots: RobotRegistry) -> None:
         self.config = config
         self.robots = robots
-        BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+        # Keep only metadata during this process so the stock backup client sees
+        # a successful upload without creating persistent backup files.
+        self._uploads: dict[tuple[str, str], dict[str, Any]] = {}
 
     def _public(self) -> str:
         return self.config["public_base_url"].rstrip("/")
-
-    def _robot_dir(self, robot_id: str) -> Path:
-        path = BACKUPS_DIR / safe_id(robot_id)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
 
     def new_upload(self, *, robot_id: str, loop_id: str) -> dict[str, str]:
         rid = safe_id(robot_id)
@@ -256,12 +265,6 @@ class BackupStore:
         log_line(f"Backup.New robot={rid!r} loopId={loop_id!r} -> {url}")
         return {"uploadUrl": url}
 
-    def _meta_path(self, robot_id: str, name: str) -> Path:
-        return self._robot_dir(robot_id) / f"{name}.json"
-
-    def _data_path(self, robot_id: str, name: str) -> Path:
-        return self._robot_dir(robot_id) / name
-
     def save_upload(
         self,
         robot_id: str,
@@ -272,39 +275,30 @@ class BackupStore:
         length: int | None = None,
         loop_id: str | None = None,
     ) -> str:
-        """Store a backup blob. Prefer stream+length for large robot uploads."""
+        """Consume and checksum a backup blob without storing its contents."""
         if "/" in name or name.startswith(".") or not name:
             raise ValueError("bad backup name")
         if "/" in robot_id or robot_id.startswith(".") or not robot_id:
             raise ValueError("bad robot id")
-        data_path = self._data_path(robot_id, name)
-        tmp = Path(str(data_path) + ".partial")
         md5 = hashlib.md5()
         size = 0
-        with tmp.open("wb") as out:
-            if stream is not None and length is not None:
-                remaining = max(0, int(length))
-                while remaining > 0:
-                    chunk = stream.read(min(STREAM_CHUNK, remaining))
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    md5.update(chunk)
-                    size += len(chunk)
-                    remaining -= len(chunk)
-            else:
-                data = body or b""
-                out.write(data)
-                md5.update(data)
-                size = len(data)
+        if stream is not None and length is not None:
+            remaining = max(0, int(length))
+            while remaining > 0:
+                chunk = stream.read(min(STREAM_CHUNK, remaining))
+                if not chunk:
+                    break
+                md5.update(chunk)
+                size += len(chunk)
+                remaining -= len(chunk)
+        else:
+            data = body or b""
+            md5.update(data)
+            size = len(data)
         if length is not None and size != int(length):
-            # S3 fails a short PUT; keeping it would hand the robot a matching
-            # ETag for a truncated (undecryptable) backup.
-            tmp.unlink(missing_ok=True)
             raise IncompleteUpload(
                 f"got {size} of {length} bytes for {robot_id}/{name}"
             )
-        tmp.replace(data_path)
         quoted = f'"{md5.hexdigest()}"'
         profile = self.robots.get(robot_id) or {}
         meta = {
@@ -317,8 +311,11 @@ class BackupStore:
             "size": size,
             "modified": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         }
-        self._meta_path(robot_id, name).write_text(json.dumps(meta), encoding="utf-8")
-        log_line(f"Backup PUT robot={robot_id!r} name={name} bytes={size} etag={quoted}")
+        self._uploads[(robot_id, name)] = meta
+        log_line(
+            f"Backup PUT robot={robot_id!r} name={name} bytes={size} "
+            f"etag={quoted} (discarded)"
+        )
         return quoted
 
     def list_for_robot(self, *, robot_id: str, loop_id: str) -> list[dict[str, Any]]:
@@ -331,25 +328,20 @@ class BackupStore:
         entries from another loopId are skipped because they were encrypted with
         a different symmetric key.
         """
-        candidates: list[tuple[str, dict[str, Any]]] = []
-        skipped = 0
-        robot_dir = self._robot_dir(robot_id)
-        for meta_path in robot_dir.glob("*.json"):
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            name = meta.get("name") or meta_path.stem
-            if not self._data_path(robot_id, name).is_file():
-                continue
-            if meta.get("loopId") and str(meta["loopId"]) != str(loop_id):
-                skipped += 1
-                continue
-            candidates.append((str(meta.get("modified") or ""), meta))
+        all_for_robot = [
+            meta for (stored_robot, _), meta in self._uploads.items()
+            if stored_robot == robot_id
+        ]
+        candidates = [
+            meta
+            for meta in all_for_robot
+            if not meta.get("loopId") or str(meta["loopId"]) == str(loop_id)
+        ]
+        skipped = len(all_for_robot) - len(candidates)
         items: list[dict[str, Any]] = []
         if candidates:
             # ISO-8601 UTC strings sort chronologically; newest wins.
-            _, meta = max(candidates, key=lambda pair: pair[0])
+            meta = max(candidates, key=lambda item: str(item.get("modified") or ""))
             name = meta.get("name")
             items.append(
                 {
@@ -369,17 +361,8 @@ class BackupStore:
         return items
 
     def locate(self, robot_id: str, name: str) -> tuple[Path, dict[str, Any]] | None:
-        data_path = self._data_path(robot_id, name)
-        meta_path = self._meta_path(robot_id, name)
-        if not data_path.is_file():
-            return None
-        meta: dict[str, Any] = {}
-        if meta_path.is_file():
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                meta = {}
-        return data_path, meta
+        # No-op uploads have no downloadable backup payload.
+        return None
 
 
 class KeyStore:
@@ -463,17 +446,13 @@ class KeyStore:
 
 
 class MediaStore:
-    """Media_20160725 (Create/List/Get/Remove) backed by files on disk."""
+    """Media_20160725 compatibility responses without file storage."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
-        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
     def _public(self) -> str:
         return self.config["public_base_url"].rstrip("/")
-
-    def _robot_dir(self, robot_id: str) -> Path:
-        return MEDIA_DIR / safe_id(robot_id)
 
     def create(
         self,
@@ -488,9 +467,6 @@ class MediaStore:
         meta: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         name = safe_id(path) or uuid.uuid4().hex
-        robot_dir = self._robot_dir(robot_id)
-        robot_dir.mkdir(parents=True, exist_ok=True)
-        (robot_dir / name).write_bytes(body)
         rec = {
             "path": path or name,
             "type": media_type or "application/octet-stream",
@@ -504,20 +480,7 @@ class MediaStore:
         }
         if meta:
             rec["meta"] = meta
-        save_json(robot_dir / f"{name}.json", rec)
         return rec
-
-    def _records(self, robot_id: str) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        robot_dir = self._robot_dir(robot_id)
-        if not robot_dir.is_dir():
-            return out
-        for meta_path in sorted(robot_dir.glob("*.json")):
-            try:
-                out.append(json.loads(meta_path.read_text(encoding="utf-8")))
-            except (OSError, json.JSONDecodeError):
-                continue
-        return out
 
     def list(
         self,
@@ -527,32 +490,13 @@ class MediaStore:
         after: int | None = None,
         before: int | None = None,
     ) -> list[dict[str, Any]]:
-        out = []
-        for rec in self._records(robot_id):
-            if loop_ids and str(rec.get("loopId")) not in loop_ids:
-                continue
-            created = int(rec.get("created") or 0)
-            if after is not None and created <= after:
-                continue
-            if before is not None and created >= before:
-                continue
-            out.append(rec)
-        return out
+        return []
 
     def get(self, *, robot_id: str, paths: list[str]) -> list[dict[str, Any]]:
-        wanted = {str(p) for p in paths}
-        return [rec for rec in self._records(robot_id) if rec.get("path") in wanted]
+        return []
 
     def remove(self, *, robot_id: str, paths: list[str]) -> list[dict[str, Any]]:
-        out = []
-        for rec in self.get(robot_id=robot_id, paths=paths):
-            name = safe_id(rec["path"])
-            robot_dir = self._robot_dir(robot_id)
-            (robot_dir / name).unlink(missing_ok=True)
-            rec["isDeleted"] = True
-            save_json(robot_dir / f"{name}.json", rec)
-            out.append(rec)
-        return out
+        return []
 
 
 def version_key(v: str) -> tuple:
@@ -897,6 +841,15 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/reload":
+            peer_ip = self.client_address[0]
+            if not reload_allowed(peer_ip):
+                log_line(f"reload denied for peer={peer_ip!r}")
+                self._send_error_json(
+                    403,
+                    "AccessDenied",
+                    "reload is limited to 192.168.0.0/16 except 192.168.7.55",
+                )
+                return
             # Re-read config so public_base_url (and similar) take effect without
             # a full process restart.
             try:
