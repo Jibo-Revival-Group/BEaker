@@ -4,6 +4,13 @@ This is a simple public OTA server for BEam. The update catalog and package
 downloads are the real service; the other API routes exist only to keep Jibo's
 classic clients moving through their expected protocol calls.
 
+It is **HEAVILY** encouraged that you do not self-host this. If you are to self-host
+BEaker you get zero extra capability from using the BEam update script, and it makes
+troubleshooting on the Discord quite difficult as we are unaware as to what version
+of BEam or other Jibo Software you may be running. Another reason you shouldn't self-host
+BEaker is that it has many environment specific code, that is specifically so that it will
+run well on the 5x1 servers.
+
 ## Compatibility no-ops
 
 - Backup uploads are consumed and checksummed, then discarded. Backup metadata
