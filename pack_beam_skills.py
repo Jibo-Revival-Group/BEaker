@@ -267,6 +267,25 @@ def main() -> None:
             print(f"manifest: {subsystem} {from_ver} -> {to_ver} filter={filt} id={entry_id}")
         next_from[subsystem] = to_ver
 
+    # Keep non-BEam rows (services, os, …) that other packers own.
+    beam_subsystems = {spec["subsystem"] for spec in SKILL_SPECS}
+    if MANIFEST.is_file():
+        try:
+            existing = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = []
+        kept = [
+            e
+            for e in existing
+            if isinstance(e, dict) and e.get("subsystem") not in beam_subsystems
+        ]
+        if kept:
+            print(
+                f"preserving {len(kept)} non-BEam manifest row(s): "
+                + ", ".join(sorted({e.get('subsystem', '?') for e in kept}))
+            )
+            manifest.extend(kept)
+
     MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"\nwrote {MANIFEST} ({len(manifest)} updates)")
 
