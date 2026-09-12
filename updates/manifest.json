@@ -2,40 +2,40 @@
   {
     "_id": "beam-be-eau",
     "fromVersion": "10.0.18",
-    "toVersion": "13.0.0",
+    "toVersion": "13.0.3",
     "subsystem": "@be/be",
     "filter": "eau",
-    "changes": "BEam @be/be (13.0.0)",
+    "changes": "BEam @be/be (13.0.3)",
     "package": "beam-be.tar",
     "dependencies": {}
   },
   {
     "_id": "beam-be-fcs",
     "fromVersion": "10.0.18",
-    "toVersion": "13.0.0",
+    "toVersion": "13.0.3",
     "subsystem": "@be/be",
     "filter": "fcs",
-    "changes": "BEam @be/be (13.0.0)",
+    "changes": "BEam @be/be (13.0.3)",
     "package": "beam-be.tar",
     "dependencies": {}
   },
   {
     "_id": "beam-oobe-config-eau",
     "fromVersion": "9.0.0",
-    "toVersion": "9.0.0+beam.1",
+    "toVersion": "9.0.1",
     "subsystem": "oobe-config",
     "filter": "eau",
-    "changes": "BEam oobe-config (9.0.0)",
+    "changes": "BEam oobe-config (9.0.1)",
     "package": "beam-oobe-config.tar",
     "dependencies": {}
   },
   {
     "_id": "beam-oobe-config-fcs",
     "fromVersion": "9.0.0",
-    "toVersion": "9.0.0+beam.1",
+    "toVersion": "9.0.1",
     "subsystem": "oobe-config",
     "filter": "fcs",
-    "changes": "BEam oobe-config (9.0.0)",
+    "changes": "BEam oobe-config (9.0.1)",
     "package": "beam-oobe-config.tar",
     "dependencies": {}
   },
@@ -62,20 +62,20 @@
   {
     "_id": "beam-jibo-tbd-eau",
     "fromVersion": "BEam.1.1.0",
-    "toVersion": "3.0.0.b",
+    "toVersion": "3.1.2",
     "subsystem": "jibo-tbd",
     "filter": "eau",
-    "changes": "BEam jibo-tbd (3.0.0.b)",
+    "changes": "BEam jibo-tbd (3.1.2)",
     "package": "beam-jibo-tbd.tar",
     "dependencies": {}
   },
   {
     "_id": "beam-jibo-tbd-fcs",
     "fromVersion": "BEam.1.1.0",
-    "toVersion": "3.0.0.b",
+    "toVersion": "3.1.2",
     "subsystem": "jibo-tbd",
     "filter": "fcs",
-    "changes": "BEam jibo-tbd (3.0.0.b)",
+    "changes": "BEam jibo-tbd (3.1.2)",
     "package": "beam-jibo-tbd.tar",
     "dependencies": {}
   },
@@ -97,6 +97,26 @@
     "filter": "fcs",
     "changes": "BEam fin-goods-test (3.0.0)",
     "package": "beam-fin-goods-test.tar",
+    "dependencies": {}
+  },
+  {
+    "_id": "bench-services-eau",
+    "fromVersion": "13.0.0",
+    "toVersion": "13.0.1",
+    "subsystem": "services",
+    "filter": "eau",
+    "changes": "BEnch services (13.0.1)",
+    "package": "bench-services.tar",
+    "dependencies": {}
+  },
+  {
+    "_id": "bench-services-fcs",
+    "fromVersion": "13.0.0",
+    "toVersion": "13.0.1",
+    "subsystem": "services",
+    "filter": "fcs",
+    "changes": "BEnch services (13.0.1)",
+    "package": "bench-services.tar",
     "dependencies": {}
   }
 ]

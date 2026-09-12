@@ -57,11 +57,23 @@ def build_package(
     noop: bool = False,
     exclude: list[str] | None = None,
     stamp_version: str | None = None,
+    filesystem_tbz: Path | None = None,
 ) -> Path:
+    """Build a stock outer OTA tar.
+
+    Skill packages pass ``content_dir`` (packed into filesystem.tar.bz2 here).
+    System packages pass a pre-built ``filesystem_tbz`` so the caller can
+    control ownership/symlink metadata member-by-member.
+    """
     outfile = outfile.resolve()
     outfile.parent.mkdir(parents=True, exist_ok=True)
     if outfile.exists():
         outfile.unlink()
+
+    if filesystem_tbz is not None and content_dir is not None:
+        raise ValueError("pass content_dir or filesystem_tbz, not both")
+    if filesystem_tbz is not None and noop:
+        raise ValueError("filesystem_tbz is incompatible with noop")
 
     # Prefer a temp dir on the same filesystem as the skill tree so hardlinks
     # work; /tmp and /var/tmp are often a different device.
@@ -79,7 +91,12 @@ def build_package(
         stage.mkdir()
 
         fs_tbz = stage / "filesystem.tar.bz2"
-        if noop:
+        if filesystem_tbz is not None:
+            src = filesystem_tbz.resolve()
+            if not src.is_file():
+                raise FileNotFoundError(src)
+            shutil.copy2(src, fs_tbz)
+        elif noop:
             fs_root = Path(tmp) / "fs"
             fs_root.mkdir()
             (fs_root / "README.local-ota").write_text(
@@ -96,7 +113,7 @@ def build_package(
             )
         else:
             if content_dir is None:
-                raise ValueError("content_dir required unless noop")
+                raise ValueError("content_dir or filesystem_tbz required unless noop")
             content_dir = content_dir.resolve()
             if not content_dir.is_dir():
                 raise FileNotFoundError(content_dir)
@@ -142,14 +159,19 @@ def main() -> None:
         help="tar --exclude pattern (repeatable)",
     )
     ap.add_argument(
+        "--filesystem-tbz",
+        type=Path,
+        help="Pre-built filesystem.tar.bz2 (system packages; skips content packing)",
+    )
+    ap.add_argument(
         "--noop",
         action="store_true",
         help="Build a tiny no-op package for download testing",
     )
     args = ap.parse_args()
 
-    if not args.noop and not args.content_dir:
-        ap.error("provide --content-dir or --noop")
+    if not args.noop and not args.content_dir and not args.filesystem_tbz:
+        ap.error("provide --content-dir, --filesystem-tbz, or --noop")
 
     build_package(
         outfile=args.outfile,
@@ -158,6 +180,7 @@ def main() -> None:
         postinstall=args.postinstall,
         noop=args.noop,
         exclude=args.exclude,
+        filesystem_tbz=args.filesystem_tbz,
     )
 
 
