@@ -8,6 +8,7 @@ __pycache__/
 
 # Built OTA packages (repack with pack_beam_skills.py)
 updates/packages/
+updates/manifest.json
 
 # Runtime state written by the server
 updates/backups/
