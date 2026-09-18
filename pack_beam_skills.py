@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-from make_package import build_package  # noqa: E402
+from make_package import atomic_write_text, build_package  # noqa: E402
 
 FROM_VERSIONS_PATH = ROOT / "updates" / "from-versions.json"
 PACKAGES = ROOT / "updates" / "packages"
@@ -91,9 +91,8 @@ def load_from_versions() -> dict[str, str]:
 
 
 def save_from_versions(data: dict[str, str]) -> None:
-    FROM_VERSIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    FROM_VERSIONS_PATH.write_text(
-        json.dumps(data, indent=2) + "\n", encoding="utf-8"
+    atomic_write_text(
+        FROM_VERSIONS_PATH, json.dumps(data, indent=2) + "\n"
     )
 
 
@@ -286,7 +285,7 @@ def main() -> None:
             )
             manifest.extend(kept)
 
-    MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(MANIFEST, json.dumps(manifest, indent=2) + "\n")
     print(f"\nwrote {MANIFEST} ({len(manifest)} updates)")
 
     if args.advance_from:

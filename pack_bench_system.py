@@ -25,7 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-from make_package import build_package  # noqa: E402
+from make_package import atomic_write_text, build_package  # noqa: E402
 
 FROM_VERSIONS_PATH = ROOT / "updates" / "from-versions.json"
 REFERENCE_PATH = ROOT / "updates" / "services-reference.tsv"
@@ -64,9 +64,8 @@ def load_from_versions() -> dict[str, str]:
 
 
 def save_from_versions(data: dict[str, str]) -> None:
-    FROM_VERSIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    FROM_VERSIONS_PATH.write_text(
-        json.dumps(data, indent=2) + "\n", encoding="utf-8"
+    atomic_write_text(
+        FROM_VERSIONS_PATH, json.dumps(data, indent=2) + "\n"
     )
 
 
@@ -275,7 +274,7 @@ def merge_manifest(
             f"filter={filt} id={entry_id}"
         )
 
-    MANIFEST.write_text(json.dumps(kept, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(MANIFEST, json.dumps(kept, indent=2) + "\n")
     print(f"wrote {MANIFEST} ({len(kept)} updates)")
     return kept
 

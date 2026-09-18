@@ -17,6 +17,7 @@ Field names and shapes come from the robot's own
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import socket
 import subprocess
@@ -159,7 +160,21 @@ def main() -> int:
             run_checks(base)
             check(
                 "backup payload is not persisted",
-                not (updates / "backups" / ROBOT).exists(),
+                not any(
+                    p.is_file() and not p.name.endswith(".meta.json")
+                    for p in (updates / "backups" / ROBOT).glob("*")
+                )
+                if (updates / "backups" / ROBOT).is_dir()
+                else True,
+            )
+            check(
+                "backup metadata can be persisted",
+                any(
+                    p.name.endswith(".meta.json")
+                    for p in (updates / "backups" / ROBOT).glob("*")
+                )
+                if (updates / "backups" / ROBOT).is_dir()
+                else False,
             )
             check(
                 "media payload is not persisted",
@@ -195,6 +210,51 @@ def run_checks(base: str) -> None:
         (data or {}).get("filter") == "fcs",
         str((data or {}).get("filter")),
     )
+    update = data or {}
+    sha = update.get("shaHash") or ""
+    url = update.get("url") or ""
+    check(
+        "package URL is content-addressed",
+        f"/packages/{sha}/" in url and url.endswith("selftest.tar"),
+        url,
+    )
+    pkg_req = urllib.request.Request(url)
+    with urllib.request.urlopen(pkg_req) as resp:
+        body = resp.read()
+        cc = resp.headers.get("Cache-Control") or ""
+        check("package response is 200", resp.status == 200)
+        check(
+            "package Cache-Control is no-store",
+            "no-store" in cc,
+            cc,
+        )
+        check(
+            "package ETag matches shaHash",
+            (resp.headers.get("ETag") or "").strip('"') == sha,
+            str(resp.headers.get("ETag")),
+        )
+        check(
+            "downloaded package matches shaHash",
+            hashlib.sha1(body).hexdigest() == sha,
+        )
+    # Legacy /packages/<name> still works for local scripts.
+    legacy = base + "/packages/selftest.tar"
+    with urllib.request.urlopen(legacy) as resp:
+        check(
+            "legacy package path still works",
+            resp.status == 200 and "no-store" in (resp.headers.get("Cache-Control") or ""),
+        )
+    # Wrong hash in path must 404.
+    try:
+        urllib.request.urlopen(base + "/packages/" + ("0" * 40) + "/selftest.tar")
+        check("wrong package hash is 404", False, "unexpected 200")
+    except urllib.error.HTTPError as exc:
+        check("wrong package hash is 404", exc.code == 404, str(exc))
+
+    with urllib.request.urlopen(base + "/health") as resp:
+        health = json.loads(resp.read())
+    check("health reports packages", isinstance(health.get("packages"), list))
+    check("health ok when packages match", health.get("ok") is True, str(health))
     status, data = call(
         base,
         "Update_20160301.GetUpdateFrom",

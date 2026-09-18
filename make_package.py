@@ -12,6 +12,20 @@ import tempfile
 from pathlib import Path
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write text via a same-dir temp file + os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".partial")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        with tmp.open("rb") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _stage_content(
     content_dir: Path, dest: Path, *, stamp_version: str | None
 ) -> None:
@@ -67,8 +81,6 @@ def build_package(
     """
     outfile = outfile.resolve()
     outfile.parent.mkdir(parents=True, exist_ok=True)
-    if outfile.exists():
-        outfile.unlink()
 
     if filesystem_tbz is not None and content_dir is not None:
         raise ValueError("pass content_dir or filesystem_tbz, not both")
@@ -85,6 +97,12 @@ def build_package(
             tmp_parent = candidate
         except OSError:
             tmp_parent = outfile.parent
+
+    # Publish via same-dir .partial + os.replace so a live server never serves a
+    # half-written tar (and Cloudflare cannot cache a torn object from origin).
+    partial = outfile.with_name(outfile.name + ".partial")
+    if partial.exists():
+        partial.unlink()
 
     with tempfile.TemporaryDirectory(prefix="jibo-ota-", dir=tmp_parent) as tmp:
         stage = Path(tmp) / "stage"
@@ -136,7 +154,10 @@ def build_package(
             dest.write_bytes(postinstall.read_bytes())
             dest.chmod(0o755)
 
-        subprocess.check_call(["tar", "-C", str(stage), "-cf", str(outfile), "."])
+        subprocess.check_call(["tar", "-C", str(stage), "-cf", str(partial), "."])
+        with partial.open("rb") as f:
+            os.fsync(f.fileno())
+        os.replace(partial, outfile)
 
     print(f"wrote {outfile} ({outfile.stat().st_size} bytes)")
     return outfile

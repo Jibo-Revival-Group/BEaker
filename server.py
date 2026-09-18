@@ -29,7 +29,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
-import random
+import os
 import re
 import sys
 import time
@@ -96,9 +96,22 @@ def load_json(path: Path) -> Any:
         return json.load(f)
 
 
-def save_json(path: Path, data: Any) -> None:
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write text via a same-dir temp file + os.replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp = path.with_name(path.name + ".partial")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        with tmp.open("rb") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def save_json(path: Path, data: Any) -> None:
+    atomic_write_text(path, json.dumps(data, indent=2) + "\n")
 
 
 def sha1_file(path: Path) -> str:
@@ -107,6 +120,17 @@ def sha1_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def package_url(public: str, sha_hash: str, pkg_name: str) -> str:
+    """Content-addressed URL so CDN caches cannot serve a stale body for a new hash."""
+    return f"{public.rstrip('/')}/packages/{sha_hash}/{pkg_name}"
+
+
+NO_STORE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+}
 
 
 def safe_id(value: str) -> str:
@@ -242,14 +266,38 @@ class IncompleteUpload(Exception):
 
 
 class BackupStore:
-    """Protocol-compatible backup stand-in that discards uploaded blobs."""
+    """Protocol-compatible backup stand-in that discards uploaded blobs.
+
+    Metadata is kept on disk under updates/backups/<robot>/<name>.meta.json so a
+    mid-Install restart still answers Backup.List. The archive bytes are never
+    written.
+    """
 
     def __init__(self, config: dict[str, Any], robots: RobotRegistry) -> None:
         self.config = config
         self.robots = robots
-        # Keep only metadata during this process so the stock backup client sees
-        # a successful upload without creating persistent backup files.
         self._uploads: dict[tuple[str, str], dict[str, Any]] = {}
+        BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+        self._load_persisted()
+
+    def _meta_path(self, robot_id: str, name: str) -> Path:
+        return BACKUPS_DIR / safe_id(robot_id) / f"{safe_id(name)}.meta.json"
+
+    def _load_persisted(self) -> None:
+        if not BACKUPS_DIR.is_dir():
+            return
+        for path in BACKUPS_DIR.glob("*/*.meta.json"):
+            try:
+                meta = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            robot_id = str(meta.get("robotId") or path.parent.name)
+            name = str(meta.get("name") or "")
+            if not name:
+                continue
+            self._uploads[(robot_id, name)] = meta
+        if self._uploads:
+            log_line(f"restored {len(self._uploads)} backup metadata record(s)")
 
     def _public(self) -> str:
         return self.config["public_base_url"].rstrip("/")
@@ -312,6 +360,10 @@ class BackupStore:
             "modified": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         }
         self._uploads[(robot_id, name)] = meta
+        try:
+            save_json(self._meta_path(robot_id, name), meta)
+        except OSError as exc:
+            log_line(f"warning: could not persist backup meta: {exc}")
         log_line(
             f"Backup PUT robot={robot_id!r} name={name} bytes={size} "
             f"etag={quoted} (discarded)"
@@ -512,19 +564,27 @@ def version_key(v: str) -> tuple:
 class Catalog:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
+        self.updates: list[dict[str, Any]] = []
         self.reload()
 
     def reload(self) -> None:
         raw = load_json(MANIFEST_PATH)
-        self.updates: list[dict[str, Any]] = []
+        built: list[dict[str, Any]] = []
+        public = self.config["public_base_url"].rstrip("/")
+        # Hash each distinct package file once (eau/fcs rows share one tar).
+        hash_cache: dict[str, tuple[str, int]] = {}
         for entry in raw:
             pkg_name = entry["package"]
             pkg_path = PACKAGES_DIR / pkg_name
             if not pkg_path.is_file():
                 print(f"warning: missing package {pkg_path}", file=sys.stderr)
                 continue
+            if pkg_name not in hash_cache:
+                digest = sha1_file(pkg_path)
+                length = pkg_path.stat().st_size
+                hash_cache[pkg_name] = (digest, length)
+            digest, length = hash_cache[pkg_name]
             uid = entry.get("_id") or pkg_path.stem
-            public = self.config["public_base_url"].rstrip("/")
             record = {
                 "_id": uid,
                 "created": entry.get("created", int(time.time() * 1000)),
@@ -532,17 +592,65 @@ class Catalog:
                 "fromVersion": entry["fromVersion"],
                 "toVersion": entry["toVersion"],
                 "changes": entry.get("changes", ""),
-                "url": f"{public}/packages/{pkg_name}",
-                "shaHash": sha1_file(pkg_path),
-                "length": pkg_path.stat().st_size,
+                "url": package_url(public, digest, pkg_name),
+                "shaHash": digest,
+                "length": length,
                 "subsystem": entry["subsystem"],
                 # Keep multi-flag filters as a comma string for matching + responses.
                 "filter": ",".join(normalize_filters(entry.get("filter", ""))),
                 "dependencies": entry.get("dependencies") or {},
                 "_package_path": str(pkg_path),
+                "_package_name": pkg_name,
             }
-            self.updates.append(record)
+            built.append(record)
+        # Swap atomically so concurrent GetUpdateFrom never sees a cleared list
+        # while large packages are still being hashed.
+        self.updates = built
         print(f"loaded {len(self.updates)} update(s) from {MANIFEST_PATH}")
+
+    def package_by_name(self, pkg_name: str) -> dict[str, Any] | None:
+        for u in self.updates:
+            if u.get("_package_name") == pkg_name:
+                return u
+        return None
+
+    def integrity(self, *, verify_hash: bool = False) -> list[dict[str, Any]]:
+        """Per distinct package: on-disk size vs catalog; optionally re-hash.
+
+        Default is size-only so /health stays cheap for multi-hundred-MB
+        packages. Pass verify_hash=True after reload when a full check is wanted.
+        """
+        seen: set[str] = set()
+        rows: list[dict[str, Any]] = []
+        for u in self.updates:
+            name = u.get("_package_name") or Path(u.get("_package_path", "")).name
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            path = Path(u["_package_path"])
+            row: dict[str, Any] = {
+                "package": name,
+                "shaHash": u["shaHash"],
+                "length": u["length"],
+                "exists": path.is_file(),
+                "sizeMatch": False,
+                "hashMatch": None,
+            }
+            if path.is_file():
+                size = path.stat().st_size
+                row["sizeMatch"] = size == u["length"]
+                if not row["sizeMatch"]:
+                    row["onDiskLength"] = size
+                    row["hashMatch"] = False
+                elif verify_hash:
+                    row["hashMatch"] = sha1_file(path) == u["shaHash"]
+                else:
+                    # Catalog shaHash was computed from this size at last reload.
+                    row["hashMatch"] = True
+            else:
+                row["hashMatch"] = False
+            rows.append(row)
+        return rows
 
     def list_from(
         self, *, subsystem: str, from_version: str, filt: str
@@ -586,7 +694,8 @@ class Catalog:
             return None
         best = updates[0]["toVersion"]
         candidates = [u for u in updates if u["toVersion"] == best]
-        chosen = random.choice(candidates)
+        # Stable pick so retries never flip url/shaHash among equal toVersions.
+        chosen = sorted(candidates, key=lambda u: str(u.get("_id") or ""))[0]
         out = public_update(chosen)
         # Echo the robot's request filter when it matched a multi-flag package.
         if filt:
@@ -765,23 +874,50 @@ class Handler(BaseHTTPRequestHandler):
         *,
         content_type: str = "application/octet-stream",
         extra_headers: dict | None = None,
+        etag: str | None = None,
+        no_store: bool = False,
     ) -> None:
-        """Stream a file out; OTA packages and backups are hundreds of MB."""
-        size = path.stat().st_size
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(size))
-        if extra_headers:
-            for k, v in extra_headers.items():
-                self.send_header(k, v)
-        self.end_headers()
+        """Stream a file out; OTA packages and backups are hundreds of MB.
+
+        Open first, then fstat that fd so Content-Length matches the inode we
+        actually stream (safe across os.replace of the path).
+        """
+        started = time.monotonic()
+        sent = 0
         try:
             with path.open("rb") as f:
-                for chunk in iter(lambda: f.read(STREAM_CHUNK), b""):
-                    self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            # jibo-download-update aborts on its own 120 s socket timeout.
-            log_line(f"client hung up during {path.name}")
+                size = os.fstat(f.fileno()).st_size
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(size))
+                if no_store:
+                    for k, v in NO_STORE_HEADERS.items():
+                        self.send_header(k, v)
+                if etag:
+                    self.send_header("ETag", f'"{etag}"')
+                if extra_headers:
+                    for k, v in extra_headers.items():
+                        self.send_header(k, v)
+                self.end_headers()
+                try:
+                    for chunk in iter(lambda: f.read(STREAM_CHUNK), b""):
+                        self.wfile.write(chunk)
+                        sent += len(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    # jibo-download-update aborts on its own 120 s socket timeout.
+                    log_line(
+                        f"client hung up during {path.name} "
+                        f"sent={sent}/{size} peer={self.client_address[0]}"
+                    )
+                    return
+        except FileNotFoundError:
+            self.send_error(404, "not found")
+            return
+        elapsed = time.monotonic() - started
+        log_line(
+            f"served {path.name} bytes={sent}/{size} "
+            f"{elapsed:.1f}s peer={self.client_address[0]}"
+        )
 
     def _send_json(self, status: int, payload: Any, extra_headers: dict | None = None) -> None:
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -829,13 +965,19 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in ("/", "/health"):
             robot_count = len(list(ROBOTS_DIR.glob("*.json"))) if ROBOTS_DIR.is_dir() else 0
+            packages = self.catalog.integrity()
+            ok = all(
+                p.get("exists") and p.get("sizeMatch") and p.get("hashMatch")
+                for p in packages
+            ) if packages else True
             self._send_json(
                 200,
                 {
-                    "ok": True,
+                    "ok": ok,
                     "updates": len(self.catalog.updates),
                     "robots": robot_count,
                     "public_base_url": self.config["public_base_url"],
+                    "packages": packages,
                 },
             )
             return
@@ -874,12 +1016,29 @@ class Handler(BaseHTTPRequestHandler):
                     "reloaded": True,
                     "updates": len(self.catalog.updates),
                     "public_base_url": self.config["public_base_url"],
+                    "packages": self.catalog.integrity(verify_hash=False),
                 },
             )
             return
 
         if path.startswith("/packages/"):
-            name = path[len("/packages/") :]
+            rest = path[len("/packages/") :]
+            parts = [p for p in rest.split("/") if p]
+            if not parts or any(p.startswith(".") for p in parts):
+                self.send_error(400, "bad package path")
+                return
+            # Content-addressed: /packages/<shaHash>/<name>
+            # Legacy (local scripts): /packages/<name>
+            if len(parts) == 2:
+                want_hash, name = parts
+                if not re.fullmatch(r"[0-9a-fA-F]{40}", want_hash):
+                    self.send_error(400, "bad package hash")
+                    return
+            elif len(parts) == 1:
+                want_hash, name = None, parts[0]
+            else:
+                self.send_error(400, "bad package path")
+                return
             if "/" in name or name.startswith(".") or not name:
                 self.send_error(400, "bad package name")
                 return
@@ -887,7 +1046,24 @@ class Handler(BaseHTTPRequestHandler):
             if not pkg.is_file():
                 self.send_error(404, "package not found")
                 return
-            self._send_file(pkg)
+            record = self.catalog.package_by_name(name)
+            if record:
+                digest = record["shaHash"]
+            elif want_hash is not None:
+                # Rare: file on disk but not in catalog — hash to enforce path.
+                digest = sha1_file(pkg)
+            else:
+                digest = None
+            if want_hash is not None and (
+                digest is None or want_hash.lower() != digest.lower()
+            ):
+                log_line(
+                    f"package hash mismatch path={want_hash} catalog={digest} "
+                    f"name={name}"
+                )
+                self.send_error(404, "package hash mismatch")
+                return
+            self._send_file(pkg, etag=digest, no_store=True)
             return
 
         if path.startswith("/backups/"):
@@ -903,7 +1079,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             data_path, meta = got
             extra = {"ETag": str(meta["etag"])} if meta.get("etag") else None
-            self._send_file(data_path, extra_headers=extra)
+            self._send_file(data_path, extra_headers=extra, no_store=True)
             return
 
         if path.startswith("/media/"):
@@ -934,6 +1110,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:  # noqa: N802
         # Backup.New returns an uploadUrl; robot PUTs the blob here (unsigned).
+        # Body is MD5'd then discarded — never written to disk.
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         if not path.startswith("/backups/"):
@@ -955,7 +1132,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         length = int(raw_length or 0)
         try:
-            # Stream to disk — stock encrypted tarballs can be hundreds of MB.
+            # Drain + MD5 the body; payload is discarded (metadata only).
             etag = self.backups.save_upload(
                 robot_id,
                 name,
@@ -1482,7 +1659,7 @@ def main() -> None:
     print(f"public package URLs use {config['public_base_url']}", flush=True)
     print(f"auth {'ON' if config.get('require_auth', False) else 'OFF'}", flush=True)
     print("robot credentials endpoint should be:", config["public_base_url"], flush=True)
-    print(f"per-robot backups under {BACKUPS_DIR}/<accessKeyId>/", flush=True)
+    print(f"backup metadata under {BACKUPS_DIR}/ (payloads discarded)", flush=True)
     print(f"robot profiles under {ROBOTS_DIR}/", flush=True)
     try:
         httpd.serve_forever()

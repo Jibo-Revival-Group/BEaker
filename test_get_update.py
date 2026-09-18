@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Signed GetUpdateFrom smoke test against ota-server."""
+"""Signed GetUpdateFrom smoke test against ota-server.
+
+Works with require_auth on (uses config accounts) or off (unsigned POST with a
+synthetic Credential= access key so the server can identify the robot).
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,7 +86,6 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = json.loads(args.config.read_text())
-    access_key, secret_key = next(iter(cfg["accounts"].items()))
     body = json.dumps(
         {
             "fromVersion": args.from_version,
@@ -90,20 +94,54 @@ def main() -> None:
         }
     ).encode()
     url = args.endpoint.rstrip("/") + "/"
-    headers = sign_request(
-        method="POST",
-        url=url,
-        body=body,
-        access_key=access_key,
-        secret_key=secret_key,
-        region=cfg.get("region", "api"),
-        service=cfg.get("service", "update"),
-    )
-    # urllib sets Host itself; drop explicit Host to avoid mismatch
-    headers.pop("Host", None)
+    accounts = cfg.get("accounts") or {}
+    require_auth = bool(cfg.get("require_auth", False))
+
+    if require_auth:
+        if not accounts:
+            raise SystemExit(
+                "require_auth is true but config.accounts is empty; "
+                "add an accessKeyId/secret or set require_auth false"
+            )
+        access_key, secret_key = next(iter(accounts.items()))
+        headers = sign_request(
+            method="POST",
+            url=url,
+            body=body,
+            access_key=access_key,
+            secret_key=secret_key,
+            region=cfg.get("region", "api"),
+            service=cfg.get("service", "update"),
+        )
+        headers.pop("Host", None)
+    else:
+        # Auth off: still send Credential= so the server can key robot state.
+        access_key = next(iter(accounts), "smoke-test-robot")
+        headers = {
+            "Authorization": (
+                f"AWS4-HMAC-SHA256 Credential={access_key}/20260101/api/update/"
+                "aws4_request, SignedHeaders=host, Signature=deadbeef"
+            ),
+            "X-Amz-Target": "Update_20160301.GetUpdateFrom",
+            "Content-Type": "application/x-amz-json-1.1",
+        }
+
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req) as resp:
-        print(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read().decode()
+            print(raw)
+            data = json.loads(raw) if raw else {}
+            sha = data.get("shaHash")
+            pkg_url = data.get("url") or ""
+            if sha and f"/packages/{sha}/" not in pkg_url:
+                raise SystemExit(
+                    f"expected content-addressed url containing /packages/{sha}/, "
+                    f"got {pkg_url!r}"
+                )
+    except urllib.error.HTTPError as exc:
+        print(exc.read().decode())
+        raise SystemExit(exc.code) from exc
 
 
 if __name__ == "__main__":
