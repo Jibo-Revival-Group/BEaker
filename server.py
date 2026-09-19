@@ -876,11 +876,13 @@ class Handler(BaseHTTPRequestHandler):
         extra_headers: dict | None = None,
         etag: str | None = None,
         no_store: bool = False,
+        head_only: bool = False,
     ) -> None:
         """Stream a file out; OTA packages and backups are hundreds of MB.
 
         Open first, then fstat that fd so Content-Length matches the inode we
-        actually stream (safe across os.replace of the path).
+        actually stream (safe across os.replace of the path). head_only sends
+        the same headers with an empty body (HTTP HEAD).
         """
         started = time.monotonic()
         sent = 0
@@ -899,6 +901,8 @@ class Handler(BaseHTTPRequestHandler):
                     for k, v in extra_headers.items():
                         self.send_header(k, v)
                 self.end_headers()
+                if head_only:
+                    return
                 try:
                     for chunk in iter(lambda: f.read(STREAM_CHUNK), b""):
                         self.wfile.write(chunk)
@@ -919,7 +923,14 @@ class Handler(BaseHTTPRequestHandler):
             f"{elapsed:.1f}s peer={self.client_address[0]}"
         )
 
-    def _send_json(self, status: int, payload: Any, extra_headers: dict | None = None) -> None:
+    def _send_json(
+        self,
+        status: int,
+        payload: Any,
+        extra_headers: dict | None = None,
+        *,
+        head_only: bool = False,
+    ) -> None:
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/x-amz-json-1.1")
@@ -928,7 +939,74 @@ class Handler(BaseHTTPRequestHandler):
             for k, v in extra_headers.items():
                 self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(data)
+        if not head_only:
+            self.wfile.write(data)
+
+    def _health_payload(self, *, verify_hash: bool = False) -> dict[str, Any]:
+        robot_count = len(list(ROBOTS_DIR.glob("*.json"))) if ROBOTS_DIR.is_dir() else 0
+        packages = self.catalog.integrity(verify_hash=verify_hash)
+        ok = all(
+            p.get("exists") and p.get("sizeMatch") and p.get("hashMatch")
+            for p in packages
+        ) if packages else True
+        return {
+            "ok": ok,
+            "updates": len(self.catalog.updates),
+            "robots": robot_count,
+            "public_base_url": self.config["public_base_url"],
+            "packages": packages,
+        }
+
+    def _resolve_package(
+        self, path: str
+    ) -> tuple[Path, str | None] | None:
+        """Parse /packages/... into (pkg_path, etag) or send an error and return None."""
+        rest = path[len("/packages/") :]
+        parts = [p for p in rest.split("/") if p]
+        if not parts or any(p.startswith(".") for p in parts):
+            self.send_error(400, "bad package path")
+            return None
+        if len(parts) == 2:
+            want_hash, name = parts
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", want_hash):
+                self.send_error(400, "bad package hash")
+                return None
+        elif len(parts) == 1:
+            want_hash, name = None, parts[0]
+        else:
+            self.send_error(400, "bad package path")
+            return None
+        if "/" in name or name.startswith(".") or not name:
+            self.send_error(400, "bad package name")
+            return None
+        pkg = PACKAGES_DIR / name
+        if not pkg.is_file():
+            self.send_error(404, "package not found")
+            return None
+        record = self.catalog.package_by_name(name)
+        if record:
+            digest = record["shaHash"]
+        elif want_hash is not None:
+            digest = sha1_file(pkg)
+        else:
+            digest = None
+        if want_hash is not None and (
+            digest is None or want_hash.lower() != digest.lower()
+        ):
+            log_line(
+                f"package hash mismatch path={want_hash} catalog={digest} "
+                f"name={name}"
+            )
+            self.send_error(404, "package hash mismatch")
+            return None
+        return pkg, digest
+
+    def _serve_package(self, path: str, *, head_only: bool = False) -> None:
+        resolved = self._resolve_package(path)
+        if resolved is None:
+            return
+        pkg, digest = resolved
+        self._send_file(pkg, etag=digest, no_store=True, head_only=head_only)
 
     def _send_error_json(self, status: int, code: str, message: str) -> None:
         self._send_json(
@@ -964,22 +1042,7 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(parsed.path)
 
         if path in ("/", "/health"):
-            robot_count = len(list(ROBOTS_DIR.glob("*.json"))) if ROBOTS_DIR.is_dir() else 0
-            packages = self.catalog.integrity()
-            ok = all(
-                p.get("exists") and p.get("sizeMatch") and p.get("hashMatch")
-                for p in packages
-            ) if packages else True
-            self._send_json(
-                200,
-                {
-                    "ok": ok,
-                    "updates": len(self.catalog.updates),
-                    "robots": robot_count,
-                    "public_base_url": self.config["public_base_url"],
-                    "packages": packages,
-                },
-            )
+            self._send_json(200, self._health_payload(verify_hash=False))
             return
 
         if path == "/reload":
@@ -1010,60 +1073,33 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": f"config reload failed: {exc}"})
                 return
             self.catalog.reload()
+            packages = self.catalog.integrity(verify_hash=True)
+            for row in packages:
+                if not row.get("exists"):
+                    log_line(f"integrity FAIL missing package={row.get('package')}")
+                elif not row.get("sizeMatch"):
+                    log_line(
+                        f"integrity FAIL size drift package={row.get('package')} "
+                        f"catalog={row.get('length')} disk={row.get('onDiskLength')}"
+                    )
+                elif not row.get("hashMatch"):
+                    log_line(
+                        f"integrity FAIL hash drift package={row.get('package')} "
+                        f"catalog={row.get('shaHash')}"
+                    )
             self._send_json(
                 200,
                 {
                     "reloaded": True,
                     "updates": len(self.catalog.updates),
                     "public_base_url": self.config["public_base_url"],
-                    "packages": self.catalog.integrity(verify_hash=False),
+                    "packages": packages,
                 },
             )
             return
 
         if path.startswith("/packages/"):
-            rest = path[len("/packages/") :]
-            parts = [p for p in rest.split("/") if p]
-            if not parts or any(p.startswith(".") for p in parts):
-                self.send_error(400, "bad package path")
-                return
-            # Content-addressed: /packages/<shaHash>/<name>
-            # Legacy (local scripts): /packages/<name>
-            if len(parts) == 2:
-                want_hash, name = parts
-                if not re.fullmatch(r"[0-9a-fA-F]{40}", want_hash):
-                    self.send_error(400, "bad package hash")
-                    return
-            elif len(parts) == 1:
-                want_hash, name = None, parts[0]
-            else:
-                self.send_error(400, "bad package path")
-                return
-            if "/" in name or name.startswith(".") or not name:
-                self.send_error(400, "bad package name")
-                return
-            pkg = PACKAGES_DIR / name
-            if not pkg.is_file():
-                self.send_error(404, "package not found")
-                return
-            record = self.catalog.package_by_name(name)
-            if record:
-                digest = record["shaHash"]
-            elif want_hash is not None:
-                # Rare: file on disk but not in catalog — hash to enforce path.
-                digest = sha1_file(pkg)
-            else:
-                digest = None
-            if want_hash is not None and (
-                digest is None or want_hash.lower() != digest.lower()
-            ):
-                log_line(
-                    f"package hash mismatch path={want_hash} catalog={digest} "
-                    f"name={name}"
-                )
-                self.send_error(404, "package hash mismatch")
-                return
-            self._send_file(pkg, etag=digest, no_store=True)
+            self._serve_package(path, head_only=False)
             return
 
         if path.startswith("/backups/"):
@@ -1104,6 +1140,21 @@ class Handler(BaseHTTPRequestHandler):
                 except (OSError, json.JSONDecodeError):
                     pass
             self._send_file(data_path, content_type=ctype)
+            return
+
+        self.send_error(404, "not found")
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        """Same headers as GET for health/packages so CF/probes never see 501."""
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+
+        if path in ("/", "/health"):
+            self._send_json(200, self._health_payload(verify_hash=False), head_only=True)
+            return
+
+        if path.startswith("/packages/"):
+            self._serve_package(path, head_only=True)
             return
 
         self.send_error(404, "not found")

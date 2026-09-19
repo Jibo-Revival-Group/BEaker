@@ -251,6 +251,28 @@ def run_checks(base: str) -> None:
     except urllib.error.HTTPError as exc:
         check("wrong package hash is 404", exc.code == 404, str(exc))
 
+    head_req = urllib.request.Request(url, method="HEAD")
+    with urllib.request.urlopen(head_req) as resp:
+        head_cc = resp.headers.get("Cache-Control") or ""
+        head_etag = (resp.headers.get("ETag") or "").strip('"')
+        head_len = resp.headers.get("Content-Length")
+        head_body = resp.read()
+        check("HEAD package is 200", resp.status == 200)
+        check("HEAD package Cache-Control is no-store", "no-store" in head_cc, head_cc)
+        check("HEAD package ETag matches shaHash", head_etag == sha, head_etag)
+        check(
+            "HEAD package Content-Length matches GET body",
+            head_len == str(len(body)),
+            f"{head_len} vs {len(body)}",
+        )
+        check("HEAD package has empty body", head_body == b"", repr(head_body[:20]))
+
+    health_head = urllib.request.Request(base + "/health", method="HEAD")
+    with urllib.request.urlopen(health_head) as resp:
+        check("HEAD /health is 200", resp.status == 200)
+        check("HEAD /health has Content-Length", bool(resp.headers.get("Content-Length")))
+        check("HEAD /health has empty body", resp.read() == b"")
+
     with urllib.request.urlopen(base + "/health") as resp:
         health = json.loads(resp.read())
     check("health reports packages", isinstance(health.get("packages"), list))
