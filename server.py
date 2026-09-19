@@ -10,7 +10,7 @@ when credentials.endpoint points here:
   POST /  X-Amz-Target: Loop_20160324.ListLoops
   POST /  X-Amz-Target: Backup_20170222.New | Backup_20170222.List
   PUT  /backups/<id>   (upload body from Backup.New uploadUrl)
-  GET  /packages/<file>
+  GET  /packages/<shaHash>/<file>
 
 Point the robot at this host via /var/jibo/credentials.json:
 
@@ -972,7 +972,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400, "bad package hash")
                 return None
         elif len(parts) == 1:
-            want_hash, name = None, parts[0]
+            # Unhashed /packages/<name> allowed robots to keep a stale shaHash
+            # while downloading the current file (checksum A != B). Only
+            # content-addressed URLs from GetUpdateFrom are accepted.
+            log_line(f"rejected legacy package path /packages/{parts[0]}")
+            self.send_error(404, "use content-addressed /packages/<shaHash>/<file>")
+            return None
         else:
             self.send_error(400, "bad package path")
             return None
@@ -986,13 +991,9 @@ class Handler(BaseHTTPRequestHandler):
         record = self.catalog.package_by_name(name)
         if record:
             digest = record["shaHash"]
-        elif want_hash is not None:
-            digest = sha1_file(pkg)
         else:
-            digest = None
-        if want_hash is not None and (
-            digest is None or want_hash.lower() != digest.lower()
-        ):
+            digest = sha1_file(pkg)
+        if want_hash.lower() != digest.lower():
             log_line(
                 f"package hash mismatch path={want_hash} catalog={digest} "
                 f"name={name}"

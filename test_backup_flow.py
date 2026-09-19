@@ -237,13 +237,14 @@ def run_checks(base: str) -> None:
             "downloaded package matches shaHash",
             hashlib.sha1(body).hexdigest() == sha,
         )
-    # Legacy /packages/<name> still works for local scripts.
+    # Legacy /packages/<name> must 404 — it caused stale-shaHash vs new-bytes
+    # checksum failures when the catalog was republished under the same path.
     legacy = base + "/packages/selftest.tar"
-    with urllib.request.urlopen(legacy) as resp:
-        check(
-            "legacy package path still works",
-            resp.status == 200 and "no-store" in (resp.headers.get("Cache-Control") or ""),
-        )
+    try:
+        urllib.request.urlopen(legacy)
+        check("legacy package path is rejected", False, "unexpected 200")
+    except urllib.error.HTTPError as exc:
+        check("legacy package path is rejected", exc.code == 404, str(exc))
     # Wrong hash in path must 404.
     try:
         urllib.request.urlopen(base + "/packages/" + ("0" * 40) + "/selftest.tar")

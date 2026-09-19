@@ -37,9 +37,10 @@ repack + restart, robots could get a fresh `shaHash` while still downloading a
 BEaker now:
 
 - Serves packages with `Cache-Control: no-store` (and `Pragma: no-cache`)
-- Advertises content-addressed URLs: `/packages/<shaHash>/<file>` so a new hash
-  cannot hit an old CF object
-- Still accepts legacy `/packages/<file>` for local scripts (also no-store)
+- Advertises **only** content-addressed URLs: `/packages/<shaHash>/<file>`
+- Rejects legacy `/packages/<file>` (404). That path let robots keep an old
+  `shaHash` from Check while downloading a newer tarball after republish —
+  exactly `checksum <new> != <old>` from `jibo-download-update`.
 
 After deploying a new `bench-services.tar` (or any package) to the live host:
 
@@ -47,6 +48,8 @@ After deploying a new `bench-services.tar` (or any package) to the live host:
 2. **Purge Cloudflare cache** for `/packages/*` on the joap zone (existing STALE
    objects will not disappear on their own while origin is down)
 3. Confirm `GET /health` shows `ok: true` and matching package sizes
+4. Robots that already cached an update must **Check again** so they pick up the
+   new URL/`shaHash` pair before Install
 
 ## Reload
 
