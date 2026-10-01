@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Minimal Jibo Update API server for local OTA.
+BEaker is the BE family's OTA server. BEefy is the conversation server.
+Robots download BEam and BEnch packages from here. GetUpdateFrom advertises
+only content-addressed /packages/<shaHash>/<file> URLs, and shaHash is the
+SHA-1 of that body. Backup.New returns immediately and Backup.List answers
+from metadata so an install is not stuck waiting on a stored archive.
 
 Speaks enough of the classic Update JSON protocol for jibo-get-update /
 jibo-download-update, plus the Backup/Loop bits jibo-system-backup needs
