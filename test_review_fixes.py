@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -79,6 +80,38 @@ def backup_checks(base: str, work: Path) -> None:
     check("only the newest backup meta per loop is kept", len(metas) == 1, str(len(metas)))
 
 
+def concurrency_checks(base: str, work: Path) -> None:
+    errs: list[str] = []
+
+    def hammer() -> None:
+        for _ in range(40):
+            try:
+                status, _ = call(base, "Loop_20160324.ListLoops", {"serial": "S1"}, robot="robot-race")
+                if status != 200:
+                    errs.append(str(status))
+            except Exception as exc:
+                errs.append(type(exc).__name__)
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    check("concurrent requests for one robot all answer", not errs, f"{len(errs)} of 320 {sorted(set(errs))}")
+    robots = work / "updates" / "robots"
+    check("no temp files left behind", not list(robots.glob("*.partial")), str(list(robots.iterdir())))
+    check("robot profile is intact", json.loads((robots / "robot-race.json").read_text())["serial"] == "S1")
+
+
+def body_checks(base: str, work: Path) -> None:
+    for target in ("Update_20160301.GetUpdateFrom", "Backup_20170222.List", "Media_20160725.Get"):
+        for raw in (b"[]", b'"x"', b"3"):
+            try:
+                status, data = call(base, target, None, raw=raw)
+                ok = status == 400 and (data or {}).get("__type") == "SerializationException"
+                check(f"{target} non-object body {raw!r} is a 400 JSON error", ok, f"{status} {data}")
+            except Exception as exc:
+                check(f"{target} non-object body {raw!r} is a 400 JSON error", False, repr(exc))
+
+
 def key_checks(base: str, work: Path) -> None:
     loop_a = loop_of(base, "robot-a")
     status, _ = call(base, "Key_20160201.Backup",
@@ -119,8 +152,9 @@ def main() -> int:
         (work / "updates" / "manifest.json").write_text("[]")
         (work / "config.json").write_text(json.dumps(
             {"host": "127.0.0.1", "port": port, "public_base_url": base, "require_auth": False, "accounts": {}}))
+        log = open(work / "server.log", "w")  # a file, not a pipe: a full pipe would block the server
         proc = subprocess.Popen([sys.executable, "server.py", "--config", str(work / "config.json")], cwd=work,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                stdout=log, stderr=subprocess.STDOUT, text=True)
         try:
             for _ in range(100):
                 try:
@@ -128,14 +162,16 @@ def main() -> int:
                     break
                 except OSError:
                     time.sleep(0.05)
-            for checks in (key_checks, backup_checks):
+            for checks in (key_checks, backup_checks, concurrency_checks, body_checks):
                 try:
                     checks(base, work)
                 except Exception as exc:  # a dropped connection is a failure, not a crash of the suite
                     check(f"{checks.__name__} ran", False, repr(exc))
         finally:
             proc.terminate()
-            out = proc.communicate(timeout=10)[0]
+            proc.wait(10)
+            log.close()
+            out = (work / "server.log").read_text()
         if FAILURES:
             print("\n--- server log ---\n" + out[-4000:])
     print(f"\n{len(FAILURES)} failure(s): {', '.join(FAILURES)}" if FAILURES else "\nall checks passed")

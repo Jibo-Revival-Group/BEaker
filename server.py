@@ -108,7 +108,8 @@ def load_json(path: Path) -> Any:
 def atomic_write_text(path: Path, text: str) -> None:
     """Write text via a same-dir temp file + os.replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".partial")
+    # Unique per write: concurrent writers of one file must not share a temp name.
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.partial")
     try:
         tmp.write_text(text, encoding="utf-8")
         with tmp.open("rb") as f:
@@ -205,6 +206,7 @@ class RobotRegistry:
 
     def __init__(self) -> None:
         ROBOTS_DIR.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()  # touch is a read-modify-write of the profile
 
     def _path(self, robot_id: str) -> Path:
         return ROBOTS_DIR / f"{safe_id(robot_id)}.json"
@@ -225,6 +227,10 @@ class RobotRegistry:
         return hashlib.sha1(robot_id.encode("utf-8")).hexdigest()[:24]
 
     def touch(self, robot_id: str, **fields: Any) -> dict[str, Any]:
+        with self._lock:
+            return self._touch(robot_id, **fields)
+
+    def _touch(self, robot_id: str, **fields: Any) -> dict[str, Any]:
         now = int(time.time() * 1000)
         data = self.get(robot_id) or {
             "robotId": robot_id,
@@ -1294,6 +1300,9 @@ class Handler(BaseHTTPRequestHandler):
                     payload = json.loads(body.decode("utf-8") or "{}")
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     payload = {}
+                if not isinstance(payload, dict):
+                    self._send_error_json(400, "SerializationException", "body must be a JSON object")
+                    return
             self._media_op(op, payload, body)
             return
 
@@ -1306,6 +1315,9 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(body.decode("utf-8") or "{}")
         except json.JSONDecodeError:
             self._send_error_json(400, "SerializationException", "invalid JSON")
+            return
+        if not isinstance(payload, dict):
+            self._send_error_json(400, "SerializationException", "body must be a JSON object")
             return
 
         # Learn serial / friendly id from whatever the robot sends. loopId is
