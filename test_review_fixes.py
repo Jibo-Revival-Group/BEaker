@@ -44,7 +44,42 @@ def loop_of(base: str, robot: str) -> str:
     return call(base, "Loop_20160324.ListLoops", {}, robot=robot)[1][0]["id"]
 
 
-def key_checks(base: str) -> None:
+def put(url: str, body: bytes = b"x"):
+    req = urllib.request.Request(url, data=body, method="PUT", headers={"Content-Type": "application/octet-stream"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, r.headers.get("ETag")
+    except urllib.error.HTTPError as e:
+        return e.code, None
+
+
+def backup_checks(base: str, work: Path) -> None:
+    loop_b = loop_of(base, "robot-b")
+    url = call(base, "Backup_20170222.New", {"loopId": loop_b}, robot="robot-b")[1]["uploadUrl"]
+    status, etag = put(url, b"real backup")
+    check("robot PUT to its uploadUrl", status == 200 and bool(etag), str(status))
+    check("uploadUrl is single-use", put(url, b"again")[0] == 403)
+    status, _ = put(f"{base}/backups/robot-b/zzz-forged?loopId={loop_b}", b"junk")
+    check("PUT without a Backup.New token is refused", status == 403, str(status))
+    url2 = call(base, "Backup_20170222.New", {"loopId": loop_b}, robot="robot-b")[1]["uploadUrl"]
+    check("token is bound to its robot/name", put(url2.replace("/robot-b/", "/robot-c/"))[0] == 403)
+    check("PUT with the token stripped is refused", put(url2.split("&")[0] if "&" in url2 else url2.split("?")[0])[0] == 403)
+    items = call(base, "Backup_20170222.List", {"loopId": loop_b}, robot="robot-b")[1]
+    check("List still shows the robot's own upload", [i["etag"] for i in items] == [etag], str(items))
+
+    # Two uploads in the same second: List must verify against the newest.
+    etags = []
+    for body in (b"first", b"second", b"third"):
+        u = call(base, "Backup_20170222.New", {"loopId": loop_b}, robot="robot-b")[1]["uploadUrl"]
+        etags.append(put(u, body)[1])
+    items = call(base, "Backup_20170222.List", {"loopId": loop_b}, robot="robot-b")[1]
+    check("same-second List returns the newest upload", [i["etag"] for i in items] == etags[-1:],
+          f"{[i['etag'] for i in items]} vs {etags}")
+    metas = list((work / "updates" / "backups" / "robot-b").glob("*.meta.json"))
+    check("only the newest backup meta per loop is kept", len(metas) == 1, str(len(metas)))
+
+
+def key_checks(base: str, work: Path) -> None:
     loop_a = loop_of(base, "robot-a")
     status, _ = call(base, "Key_20160201.Backup",
                      {"loopId": loop_a, "encryptedKey": "SECRET-A", "passwordHash": "pw-A"})
@@ -93,9 +128,9 @@ def main() -> int:
                     break
                 except OSError:
                     time.sleep(0.05)
-            for checks in (key_checks,):
+            for checks in (key_checks, backup_checks):
                 try:
-                    checks(base)
+                    checks(base, work)
                 except Exception as exc:  # a dropped connection is a failure, not a crash of the suite
                     check(f"{checks.__name__} ran", False, repr(exc))
         finally:

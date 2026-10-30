@@ -35,7 +35,9 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -56,6 +58,7 @@ MEDIA_DIR = ROOT / "updates" / "media"
 KEYS_DIR = ROOT / "updates" / "keys"
 # Same trick as srv-backup-ws: lexicographic latest-first object names.
 _BACKUP_MAGIC = 9999999999999
+UPLOAD_TOKEN_TTL = 3600  # seconds between Backup.New and the PUT
 STREAM_CHUNK = 1024 * 1024
 RELOAD_NETWORK = ipaddress.ip_network("192.168.0.0/16")
 RELOAD_DENY = ipaddress.ip_address("192.168.7.55")
@@ -283,6 +286,10 @@ class BackupStore:
         self.config = config
         self.robots = robots
         self._uploads: dict[tuple[str, str], dict[str, Any]] = {}
+        # (robot, name) -> (token, expiry). In memory only: a restart between
+        # Backup.New and the PUT fails that one backup and the robot retries.
+        self._tokens: dict[tuple[str, str], tuple[str, float]] = {}
+        self._lock = threading.Lock()
         BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
         self._load_persisted()
 
@@ -314,10 +321,24 @@ class BackupStore:
         # loopId query param survives into PUT meta even if the robot registry
         # was wiped between Backup.New and the upload (jibo-system-backup
         # never sends loopId on the PUT itself).
-        q = urlencode({"loopId": str(loop_id)})
+        token = secrets.token_urlsafe(24)
+        now = time.time()
+        with self._lock:
+            self._tokens = {k: v for k, v in self._tokens.items() if v[1] > now}
+            self._tokens[(rid, name)] = (token, now + UPLOAD_TOKEN_TTL)
+        q = urlencode({"loopId": str(loop_id), "token": token})
         url = f"{self._public()}/backups/{rid}/{name}?{q}"
-        log_line(f"Backup.New robot={rid!r} loopId={loop_id!r} -> {url}")
+        log_line(f"Backup.New robot={rid!r} loopId={loop_id!r} name={name}")
         return {"uploadUrl": url}
+
+    def claim_upload(self, robot_id: str, name: str, token: str | None) -> bool:
+        """Consume the single-use token Backup.New issued for this robot/name."""
+        with self._lock:
+            entry = self._tokens.pop((robot_id, name), None)
+        return bool(
+            entry and token and entry[1] > time.time()
+            and hmac.compare_digest(entry[0], token)
+        )
 
     def save_upload(
         self,
@@ -363,13 +384,20 @@ class BackupStore:
             "friendlyId": profile.get("friendlyId"),
             "etag": quoted,
             "size": size,
-            "modified": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "modified": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         }
-        self._uploads[(robot_id, name)] = meta
-        try:
-            save_json(self._meta_path(robot_id, name), meta)
-        except OSError as exc:
-            log_line(f"warning: could not persist backup meta: {exc}")
+        with self._lock:
+            # Only the newest backup per loop is ever listed; drop the rest so
+            # metadata cannot grow without bound (and same-second uploads can't tie).
+            for key, old in list(self._uploads.items()):
+                if key[0] == robot_id and old.get("loopId") == meta["loopId"]:
+                    del self._uploads[key]
+                    self._meta_path(*key).unlink(missing_ok=True)
+            self._uploads[(robot_id, name)] = meta
+            try:
+                save_json(self._meta_path(robot_id, name), meta)
+            except OSError as exc:
+                log_line(f"warning: could not persist backup meta: {exc}")
         log_line(
             f"Backup PUT robot={robot_id!r} name={name} bytes={size} "
             f"etag={quoted} (discarded)"
@@ -386,10 +414,11 @@ class BackupStore:
         entries from another loopId are skipped because they were encrypted with
         a different symmetric key.
         """
-        all_for_robot = [
-            meta for (stored_robot, _), meta in self._uploads.items()
-            if stored_robot == robot_id
-        ]
+        with self._lock:
+            all_for_robot = [
+                meta for (stored_robot, _), meta in self._uploads.items()
+                if stored_robot == robot_id
+            ]
         candidates = [
             meta
             for meta in all_for_robot
@@ -1203,6 +1232,11 @@ class Handler(BaseHTTPRequestHandler):
         robot_id, name = parts
         qs = parse_qs(parsed.query)
         loop_id = (qs.get("loopId") or [None])[0]
+        if not self.backups.claim_upload(robot_id, name, (qs.get("token") or [None])[0]):
+            log_line(f"Backup PUT refused robot={robot_id!r} name={name}: no valid upload token")
+            self.close_connection = True  # body is left unread
+            self.send_error(403, "upload URL not issued by Backup.New, expired or used")
+            return
         raw_length = self.headers.get("Content-Length")
         if raw_length is None:
             # S3 requires it, and jibo-system-backup always sets it; without it

@@ -78,7 +78,7 @@ def short_put(url: str, *, body: bytes, claimed_length: int) -> str:
     parsed = urllib.parse.urlparse(url)
     with socket.create_connection((parsed.hostname, parsed.port), timeout=10) as sock:
         sock.sendall(
-            f"PUT {parsed.path} HTTP/1.1\r\nHost: {parsed.netloc}\r\n"
+            f"PUT {parsed.path}?{parsed.query} HTTP/1.1\r\nHost: {parsed.netloc}\r\n"
             f"Content-Length: {claimed_length}\r\n"
             "Content-Type: application/octet-stream\r\n\r\n".encode()
             + body
