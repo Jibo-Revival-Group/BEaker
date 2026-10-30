@@ -439,11 +439,13 @@ def run_checks(base: str) -> None:
     check("Key.ShouldCreate is true (robot creates its own UGC key)",
           status == 200 and (should or {}).get("shouldCreate") is True, str(should))
     status, backed = call(
-        base, "Key_20160201.Backup", {"loopId": loop_id, "encryptedKey": "AAA="}
+        base, "Key_20160201.Backup", {"loopId": loop_id, "encryptedKey": "AAA=", "passwordHash": "pw"}
     )
     check("Key.Backup echoes loopId + encryptedKey",
           status == 200 and (backed or {}).get("encryptedKey") == "AAA=", str(backed))
-    status, restored = call(base, "Key_20160201.Restore", {"loopId": loop_id})
+    status, restored = call(
+        base, "Key_20160201.Restore", {"loopId": loop_id, "passwordHash": "pw"}
+    )
     check("Key.Restore returns the escrowed key",
           status == 200 and (restored or {}).get("encryptedKey") == "AAA=", str(restored))
     status, restored = call(

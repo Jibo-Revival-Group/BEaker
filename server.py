@@ -1412,6 +1412,8 @@ class Handler(BaseHTTPRequestHandler):
                     400, "ValidationException", "loopId and encryptedKey required"
                 )
                 return
+            if not self._owns_key_loop(profile, str(loop_id)):
+                return
             rec = self.keys.backup_key(
                 robot_id=robot_id,
                 loop_id=str(loop_id),
@@ -1430,10 +1432,12 @@ class Handler(BaseHTTPRequestHandler):
                 # SSM hasKeyBackup treats this as "no key backup".
                 self._send_error_json(404, "BACKUP_NOT_FOUND", "no key backup")
                 return
+            if not self._owns_key_loop(profile, str(loop_id)):
+                return
             # Probe with passwordHash "X" from SSM — wrong password means backup exists.
-            if payload.get("passwordHash") and payload.get("passwordHash") != rec.get(
-                "passwordHash"
-            ):
+            # A missing hash is a wrong one; otherwise anyone could skip the check.
+            given, stored = payload.get("passwordHash"), rec.get("passwordHash")
+            if not given or not stored or not hmac.compare_digest(str(given), str(stored)):
                 self._send_error_json(403, "BACKUP_PASSWORD_WRONG", "wrong password")
                 return
             self._send_json(
@@ -1450,6 +1454,17 @@ class Handler(BaseHTTPRequestHandler):
         self._send_error_json(
             400, "UnknownOperationException", f"unsupported key op: {op}"
         )
+
+    def _owns_key_loop(self, profile: dict[str, Any], loop_id: str) -> bool:
+        """Only the robot whose loop this is may back up / restore its key."""
+        rec = self.keys.restore_key(loop_id)
+        # The profile check alone is not enough: a fresh access key adopts any
+        # loopId it is sent first, so an existing backup must also be the caller's.
+        if profile.get("loopId") == loop_id and (not rec or rec.get("accountId") == profile["robotId"]):
+            return True
+        log_line(f"Key: robot={profile['robotId']!r} denied loopId={loop_id!r}")
+        self._send_error_json(403, "AccessDeniedException", "loop belongs to another robot")
+        return False
 
     def _media_op(self, op: str, payload: dict[str, Any], body: bytes) -> None:
         headers = self._headers_lower()
