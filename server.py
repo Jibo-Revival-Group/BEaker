@@ -42,7 +42,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.json"
@@ -1013,6 +1015,27 @@ class Handler(BaseHTTPRequestHandler):
         pkg, digest = resolved
         self._send_file(pkg, etag=digest, no_store=True, head_only=head_only)
 
+    def _forward_to_beefy(self, body: bytes) -> None:
+        """BEacon's personal-report calendar settings live in BEefy; robots only know this endpoint."""
+        headers = self._headers_lower()
+        keep = {k: headers[k] for k in ("x-amz-target", "x-amz-date", "authorization", "x-jibo-robotid", "content-type") if headers.get(k)}
+        url = os.environ.get("BEAKER_BEEFY_URL", "https://api.5x1.com/")
+        try:
+            with urlopen(Request(url, data=body, headers=keep, method="POST"), timeout=25) as res:
+                status, data = res.status, res.read()
+        except HTTPError as err:
+            status, data = err.code, err.read()
+        except (URLError, OSError) as err:
+            log_line(f"calendar forward failed: {err}")
+            self._send_json(502, {"error": "Could not reach the 5x1 calendar service."})
+            return
+        log_line(f"forwarded {keep.get('x-amz-target')} to BEefy -> {status}")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _send_error_json(self, status: int, code: str, message: str) -> None:
         self._send_json(
             status,
@@ -1270,6 +1293,9 @@ class Handler(BaseHTTPRequestHandler):
             self._backup_op(op, payload)
             return
         if prefix.startswith("Loop_"):
+            if op in ("GetCalendarFeeds", "SetCalendarFeed", "ClearCalendarFeed", "TestCalendarFeed"):
+                self._forward_to_beefy(body)
+                return
             if op in ("List", "ListLoops"):
                 self._loop_list(payload)
                 return
