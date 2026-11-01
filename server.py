@@ -1339,7 +1339,8 @@ class Handler(BaseHTTPRequestHandler):
             self._backup_op(op, payload)
             return
         if prefix.startswith("Loop_"):
-            if op in ("GetCalendarFeeds", "SetCalendarFeed", "ClearCalendarFeed", "TestCalendarFeed"):
+            if op in ("GetCalendarFeeds", "SetCalendarFeed", "ClearCalendarFeed", "TestCalendarFeed",
+                      "GetCommuteAddresses", "SetCommuteAddress", "ClearCommuteAddress"):
                 self._forward_to_beefy(body)
                 return
             if op in ("List", "ListLoops"):

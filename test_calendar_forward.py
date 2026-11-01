@@ -63,6 +63,10 @@ def main() -> None:
         reply.update(status=400, body=b'{"error":"memberId is required."}')
         assert post(port, "Loop_20160324.SetCalendarFeed", {"icalUrl": "https://x"}) == (400, {"error": "memberId is required."})
         assert json.loads(seen[-1]["body"]) == {"icalUrl": "https://x"}, "body passes through unchanged"
+        reply.update(status=200, body=b'{"cleared":true}')
+        for target in ("GetCommuteAddresses", "SetCommuteAddress", "ClearCommuteAddress"):
+            assert post(port, "Loop_20160324." + target, {"memberId": "m"}) == (200, {"cleared": True}), target
+            assert seen[-1]["headers"]["x-amz-target"] == "Loop_20160324." + target
         count = len(seen)
         post(port, "Loop_20160324.ListLoops", {})
         assert len(seen) == count, "other Loop targets stay local"
