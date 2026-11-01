@@ -539,26 +539,10 @@ class KeyStore:
 
 
 class MediaStore:
-    """Media_20160725: keeps each robot's media records, never the photos themselves.
-
-    The robot keeps its own photo files, but treats Media.List as the master list: anything
-    missing from it is dropped from Jibo's gallery right after upload. So records are kept
-    (a small JSON file per robot) while the uploaded bytes are still discarded.
-    """
+    """Media_20160725 compatibility responses without file storage."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
-        self._lock = threading.Lock()
-
-    def _records_path(self, robot_id: str) -> Path:
-        return MEDIA_DIR / f"{safe_id(robot_id)}.records.json"
-
-    def _load(self, robot_id: str) -> list[dict[str, Any]]:
-        try:
-            records = load_json(self._records_path(robot_id))
-        except (OSError, json.JSONDecodeError):
-            return []
-        return records if isinstance(records, list) else []
 
     def _public(self) -> str:
         return self.config["public_base_url"].rstrip("/")
@@ -589,10 +573,6 @@ class MediaStore:
         }
         if meta:
             rec["meta"] = meta
-        with self._lock:
-            records = [r for r in self._load(robot_id) if r.get("path") != rec["path"]]
-            records.append(rec)
-            save_json(self._records_path(robot_id), records)
         return rec
 
     def list(
@@ -603,28 +583,13 @@ class MediaStore:
         after: int | None = None,
         before: int | None = None,
     ) -> list[dict[str, Any]]:
-        # Oldest first: the robot pages backwards with before=<first record's created>.
-        out = [
-            r for r in self._load(robot_id)
-            if not r.get("isDeleted")
-            and (not loop_ids or r.get("loopId") in loop_ids)
-            and (after is None or r.get("created", 0) > after)
-            and (before is None or r.get("created", 0) < before)
-        ]
-        return sorted(out, key=lambda r: r.get("created", 0))
+        return []
 
     def get(self, *, robot_id: str, paths: list[str]) -> list[dict[str, Any]]:
-        return [r for r in self._load(robot_id) if r.get("path") in paths]
+        return []
 
     def remove(self, *, robot_id: str, paths: list[str]) -> list[dict[str, Any]]:
-        with self._lock:
-            records = self._load(robot_id)
-            removed = [r for r in records if r.get("path") in paths and not r.get("isDeleted")]
-            for r in removed:
-                r["isDeleted"] = True
-            if removed:
-                save_json(self._records_path(robot_id), records)
-        return removed
+        return []
 
 
 def version_key(v: str) -> tuple:
