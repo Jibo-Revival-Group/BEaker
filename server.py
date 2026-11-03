@@ -1340,7 +1340,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if prefix.startswith("Loop_"):
             if op in ("GetCalendarFeeds", "SetCalendarFeed", "ClearCalendarFeed", "TestCalendarFeed",
-                      "GetCommuteAddresses", "SetCommuteAddress", "ClearCommuteAddress"):
+                      "GetCommuteAddresses", "SetCommuteAddress", "ClearCommuteAddress", "SetPhoneBattery"):
                 self._forward_to_beefy(body)
                 return
             if op in ("List", "ListLoops"):
