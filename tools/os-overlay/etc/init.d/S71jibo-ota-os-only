@@ -1,0 +1,19 @@
+#!/bin/sh
+# Added by BEaker's stock-os package for OOBE robots. After an os-only update, the stock updater's
+# final check (S72) waits for services, but an OOBE robot's factory services can't start on this os
+# until PM installs BEnch, so it would reinstall the os forever. Skip that check only for os-only queues.
+OTA=${OTA_STATE:-/var/jibo/ota.json}
+case "$1" in
+    start)
+        [ -f "$OTA" ] || exit 0
+        if "${NODE:-/usr/bin/node}" -e '
+var s = JSON.parse(require("fs").readFileSync(process.argv[1]));
+var osOnly = s.idx === null && s.items.length > 0 && s.items.every(function (i) { return i.subsystem === "os"; });
+process.exit(osOnly ? 0 : 1);
+' "$OTA" 2>/dev/null; then
+            rm -f "$OTA" && sync
+            echo "OS update finished; run PM again to install BEam and BEnch."
+        fi
+        ;;
+esac
+exit 0

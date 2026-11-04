@@ -51,6 +51,7 @@ def build_filesystem_tar(image, root, out):
         info = debugfs(image, ['stat "%s"' % p])
         numbers[p] = tuple(map(int, re.search(r'Device major/minor number: (\d+):(\d+)', info).groups()))
     count = 0
+    overlay = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'os-overlay')
     with tarfile.open(out, 'w:bz2', format=tarfile.GNU_FORMAT) as tar:
         tar.add(root, '.', recursive=False)
         for path in sorted(entries):
@@ -75,6 +76,18 @@ def build_filesystem_tar(image, root, out):
             else:
                 tar.addfile(info)
             count += 1
+        for folder, _, files in os.walk(overlay):  # 5x1 additions, e.g. the OOBE final-check hook
+            for name in files:
+                local = os.path.join(folder, name)
+                path = '/' + os.path.relpath(local, overlay)
+                if path in entries:
+                    raise SystemExit('overlay would replace a stock file: ' + path)
+                info = tar.gettarinfo(local, '.' + path)
+                info.uid = info.gid = 0
+                info.uname = info.gname = ''
+                with open(local, 'rb') as f:
+                    tar.addfile(info, f)
+                count += 1
     return entries, count
 
 
