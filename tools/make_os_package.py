@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Build a stock-format "os" OTA package (./filesystem.tar.bz2 in a tar) from a Jibo rootfs.ext4.
+"""Build a stock-format OTA package (./filesystem.tar.bz2 in a tar) from a Jibo ext4 image (os or services).
 
 Uses e2fsprogs' debugfs instead of a loop mount, so it works in containers. Owners, modes and
 device nodes come from the image's own listing, not from the extracted copy.
-Usage: tools/make_os_package.py rootfs.ext4 updates/packages/os.tar
+Usage: tools/make_os_package.py rootfs.ext4 updates/packages/stock-os-13.0.0.tar tools/os-overlay
+       tools/make_os_package.py services.ext4 updates/packages/stock-services-13.0.0.tar
 """
 import os
 import re
@@ -41,7 +42,7 @@ def listing(image, dirs):
     return entries
 
 
-def build_filesystem_tar(image, root, out):
+def build_filesystem_tar(image, root, out, overlay=None):
     subprocess.run(['debugfs', '-R', 'rdump / ' + root, image], check=True, capture_output=True)
     dirs = ['/'] + ['/' + os.path.relpath(p, root) for p, _, _ in os.walk(root) if p != root]
     entries = listing(image, dirs)
@@ -51,7 +52,6 @@ def build_filesystem_tar(image, root, out):
         info = debugfs(image, ['stat "%s"' % p])
         numbers[p] = tuple(map(int, re.search(r'Device major/minor number: (\d+):(\d+)', info).groups()))
     count = 0
-    overlay = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'os-overlay')
     with tarfile.open(out, 'w:bz2', format=tarfile.GNU_FORMAT) as tar:
         tar.add(root, '.', recursive=False)
         for path in sorted(entries):
@@ -76,7 +76,7 @@ def build_filesystem_tar(image, root, out):
             else:
                 tar.addfile(info)
             count += 1
-        for folder, _, files in os.walk(overlay):  # 5x1 additions, e.g. the OOBE final-check hook
+        for folder, _, files in os.walk(overlay) if overlay else ():  # 5x1 additions, e.g. the OOBE final-check hook
             for name in files:
                 local = os.path.join(folder, name)
                 path = '/' + os.path.relpath(local, overlay)
@@ -103,14 +103,14 @@ def self_check(out, entries):
         assert seen.get(path) == (stat.S_IMODE(mode), uid, gid), (path, seen.get(path), oct(mode))
 
 
-def main(image, outfile):
+def main(image, outfile, overlay=None):
     work = tempfile.mkdtemp(prefix='os-pkg-', dir=os.path.dirname(os.path.abspath(outfile)))
     try:
         root, pkg = os.path.join(work, 'root'), os.path.join(work, 'pkg')
         os.mkdir(root)
         os.mkdir(pkg)
         fs_tar = os.path.join(pkg, 'filesystem.tar.bz2')
-        entries, count = build_filesystem_tar(image, root, fs_tar)
+        entries, count = build_filesystem_tar(image, root, fs_tar, overlay)
         self_check(fs_tar, entries)
         subprocess.run(['tar', '--numeric-owner', '--owner=0', '--group=0', '-C', pkg, '-cf', outfile, '.'], check=True)
         print('%s: %d entries, %d bytes' % (outfile, count, os.path.getsize(outfile)))
@@ -119,6 +119,6 @@ def main(image, outfile):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         raise SystemExit(__doc__)
-    main(sys.argv[1], sys.argv[2])
+    main(*sys.argv[1:])

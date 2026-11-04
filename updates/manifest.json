@@ -128,5 +128,15 @@
     "changes": "Stock Jibo OS 13.0.0 (for OOBE PM only)",
     "package": "stock-os-13.0.0.tar",
     "dependencies": {}
+  },
+  {
+    "_id": "stock-services-oobe",
+    "fromVersion": "0.0.0",
+    "toVersion": "13.0.0",
+    "subsystem": "services",
+    "filter": "oobe",
+    "changes": "Stock Jibo services 13.0.0 (for OOBE PM only)",
+    "package": "stock-services-13.0.0.tar",
+    "dependencies": {}
   }
 ]
