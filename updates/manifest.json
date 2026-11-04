@@ -118,5 +118,15 @@
     "changes": "BEnch services (13.0.1)",
     "package": "bench-services.tar",
     "dependencies": {}
+  },
+  {
+    "_id": "stock-os-oobe",
+    "fromVersion": "0.0.0",
+    "toVersion": "13.0.0",
+    "subsystem": "os",
+    "filter": "oobe",
+    "changes": "Stock Jibo OS 13.0.0 (for OOBE PM only)",
+    "package": "stock-os-13.0.0.tar",
+    "dependencies": {}
   }
 ]
