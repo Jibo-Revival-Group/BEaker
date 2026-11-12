@@ -1,5 +1,8 @@
 # BEaker
 
+> **Part of [5x1](https://www.5x1.com), the free public Jibo server (no account, no self-hosting).** BEaker is the update service that delivers BEam and BEnch to robots.
+> New to Jibo revival? Start with [How do I revive my Jibo?](https://www.5x1.com/revive-jibo.html) and the [setup guide](https://jibo.guide). See also [Is 5x1 safe?](https://www.5x1.com/is-5x1-safe.html) and the [privacy policy](https://www.5x1.com/privacy.html).
+
 This is a simple public OTA server for BEam. The update catalog and package
 downloads are the real service; the other API routes exist only to keep Jibo's
 classic clients moving through their expected protocol calls.
