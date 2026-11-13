@@ -6,5 +6,6 @@
   "region": "api",
   "service": "update",
   "accounts": {},
-  "account_id": "local-ota-account"
+  "account_id": "local-ota-account",
+  "store_mirror": true
 }

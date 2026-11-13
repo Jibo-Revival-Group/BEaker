@@ -43,10 +43,10 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config.json"
@@ -600,6 +600,130 @@ def version_key(v: str) -> tuple:
             continue
         out.append((0, int(p)) if p.isdigit() else (1, p.lower()))
     return tuple(out)
+
+
+# --- Store mirror ---
+# Copy of GitHub's answers for everything in the 5x1 Store, so BEacon's Store needs no GitHub sign-in.
+#
+# Every 15 minutes: read the Store's list (manifest.json), and for each GitHub repository in it look up the
+# latest release tag from github.com (a redirect, not the rate-limited API). The API itself (repository +
+# latest release) is only asked when a repository is new, its tag changed, or its copy is a day old, which
+# keeps BEaker under GitHub's logged-out limit of 60 API requests an hour.
+#
+# Served at /store/repos/<owner>/<repo> and /store/repos/<owner>/<repo>/releases/latest, in GitHub's shape.
+STORE_MANIFEST_URL = "https://store.5x1.com/manifest.json"
+STORE_INTERVAL = 15 * 60
+STORE_FULL_REFRESH = 24 * 3600  # shortcut: a release edited under the same tag shows up within a day, not 15 minutes
+STORE_REPO_URL = re.compile(r"^https?://github\.com/([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100}?)(?:\.git)?/?$", re.I)
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+def store_fetch(url: str, follow: bool = True) -> tuple[int, dict[str, str], bytes]:
+    """GET url; returns (status, headers, body) for any status."""
+    opener = build_opener() if follow else build_opener(_NoRedirect)
+    req = Request(url, headers={"User-Agent": "BEaker-Store", "Accept": "application/json, */*"})
+    try:
+        with opener.open(req, timeout=30) as res:
+            return res.status, dict(res.headers), res.read(2 * 1024 * 1024)
+    except HTTPError as err:
+        return err.code, dict(err.headers or {}), b""
+
+
+def store_repositories(manifest: Any) -> list[str]:
+    """The "owner/repo" of every GitHub entry in a Store manifest (themes, skills, voices)."""
+    found: list[str] = []
+    for section in ("themes", "skills", "voices"):
+        for item in (manifest.get(section) or []) if isinstance(manifest, dict) else []:
+            match = STORE_REPO_URL.match(item.get("url", "")) if isinstance(item, dict) and isinstance(item.get("url"), str) else None
+            if match and (match.group(1) + "/" + match.group(2)).lower() not in found:
+                found.append((match.group(1) + "/" + match.group(2)).lower())
+    return found
+
+
+def _trim_repo(data: dict[str, Any]) -> dict[str, Any]:
+    return {"owner": {"login": (data.get("owner") or {}).get("login")}, "stargazers_count": data.get("stargazers_count")}
+
+
+def _trim_release(data: dict[str, Any]) -> dict[str, Any]:
+    keep = ("id", "tag_name", "name", "html_url", "published_at", "draft", "prerelease", "zipball_url")
+    out = {key: data.get(key) for key in keep}
+    out["assets"] = [{"name": a.get("name"), "state": a.get("state"), "browser_download_url": a.get("browser_download_url")}
+                     for a in data.get("assets") or [] if isinstance(a, dict)]
+    return out
+
+
+class StoreMirror:
+    def __init__(self, path: Path, fetcher: Callable[..., tuple[int, dict[str, str], bytes]] = store_fetch,
+                 manifest_url: str = STORE_MANIFEST_URL) -> None:
+        self.path, self.fetch, self.manifest_url = path, fetcher, manifest_url
+        self.lock = threading.Lock()
+        try:
+            self.repos: dict[str, dict[str, Any]] = json.loads(path.read_text())["repos"]
+        except (OSError, ValueError, KeyError, TypeError):
+            self.repos = {}
+
+    def get(self, owner: str, repo: str, release: bool) -> dict[str, Any] | None:
+        with self.lock:
+            entry = self.repos.get((owner + "/" + repo).lower())
+        return (entry or {}).get("release" if release else "repo")
+
+    def refresh(self, now: float | None = None) -> dict[str, int]:
+        """One pass. Keeps the old copy of anything it cannot refresh."""
+        now = time.time() if now is None else now
+        stats = {"listed": 0, "updated": 0, "failed": 0}
+        status, _, body = self.fetch(self.manifest_url)
+        if status != 200:
+            raise RuntimeError(f"store manifest returned HTTP {status}")
+        names = store_repositories(json.loads(body))
+        stats["listed"] = len(names)
+        limited = False
+        for name in names:
+            with self.lock:
+                old = self.repos.get(name)
+            status, headers, _ = self.fetch(f"https://github.com/{name}/releases/latest", follow=False)
+            location = {k.lower(): v for k, v in headers.items()}.get("location", "")
+            tag = location.split("/releases/tag/", 1)[1] if status in (301, 302) and "/releases/tag/" in location else None
+            if old and old.get("tag") == tag and now - old.get("checked", 0) < STORE_FULL_REFRESH:
+                continue
+            if tag is None or limited:
+                stats["failed"] += 1
+                continue
+            api = "https://api.github.com/repos/" + name
+            repo_status, _, repo_body = self.fetch(api)
+            release_status, _, release_body = self.fetch(api + "/releases/latest")
+            if repo_status != 200 or release_status != 200:
+                # Out of logged-out API requests for this hour: stop asking, try again next pass.
+                limited = limited or repo_status in (403, 429) or release_status in (403, 429)
+                stats["failed"] += 1
+                continue
+            entry = {"tag": tag, "checked": now, "repo": _trim_repo(json.loads(repo_body)),
+                     "release": _trim_release(json.loads(release_body))}
+            with self.lock:
+                self.repos[name] = entry
+            stats["updated"] += 1
+        with self.lock:
+            # Repositories taken off the Store's list stop being served.
+            self.repos = {name: self.repos[name] for name in names if name in self.repos}
+            text = json.dumps({"repos": self.repos}, indent=1)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(text)
+        tmp.replace(self.path)
+        return stats
+
+    def run_forever(self, log: Callable[[str], None]) -> None:
+        while True:
+            try:
+                log(f"store mirror: {self.refresh()}")
+            except Exception as exc:  # keep serving the last good copy
+                log(f"store mirror refresh failed: {exc}")
+            time.sleep(STORE_INTERVAL)
+
+    def start(self, log: Callable[[str], None]) -> None:
+        threading.Thread(target=self.run_forever, args=(log,), daemon=True).start()
 
 
 class Catalog:
@@ -1159,6 +1283,16 @@ class Handler(BaseHTTPRequestHandler):
                     "packages": packages,
                 },
             )
+            return
+
+        # BEacon's Store: GitHub's repository / latest-release answers for 5x1 Store entries (store_mirror.py).
+        store = re.fullmatch(r"/store/repos/([^/]+)/([^/]+)(/releases/latest)?", path)
+        if store:
+            data = self.store.get(store.group(1), store.group(2), bool(store.group(3)))
+            if data is None:
+                self._send_error_json(404, "NotFound", "not in the 5x1 Store")
+            else:
+                self._send_json(200, data)
             return
 
         if path.startswith("/packages/"):
@@ -1796,6 +1930,10 @@ def main() -> None:
     Handler.robots = robots
     Handler.keys = keys
     Handler.media = media
+    Handler.store = StoreMirror(ROOT / "updates" / "store-mirror.json")
+    # On in the shipped config.json; tests with their own config stay off the network.
+    if config.get("store_mirror"):
+        Handler.store.start(log_line)
 
     host = config.get("host", "0.0.0.0")
     port = int(config.get("port", 8042))

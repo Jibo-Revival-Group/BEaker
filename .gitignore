@@ -23,3 +23,4 @@ updates/keys/
 .vscode/
 *.swp
 *~
+updates/store-mirror.json
