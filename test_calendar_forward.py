@@ -65,7 +65,7 @@ def main() -> None:
         assert json.loads(seen[-1]["body"]) == {"icalUrl": "https://x"}, "body passes through unchanged"
         reply.update(status=200, body=b'{"cleared":true}')
         for target in ("GetCommuteAddresses", "SetCommuteAddress", "ClearCommuteAddress", "SetPhoneBattery",
-                       "GetNewsTopics", "SetNewsTopics"):
+                       "GetNewsTopics", "SetNewsTopics", "TranslateSpeech"):
             assert post(port, "Loop_20160324." + target, {"memberId": "m"}) == (200, {"cleared": True}), target
             assert seen[-1]["headers"]["x-amz-target"] == "Loop_20160324." + target
         count = len(seen)
