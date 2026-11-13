@@ -6,7 +6,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from server import STORE_FULL_REFRESH as FULL_REFRESH, StoreMirror, store_repositories as repositories
+from server import STORE_FULL_REFRESH as FULL_REFRESH, StoreMirror, store_headers, store_repositories as repositories
 
 MANIFEST = {"themes": ["Astra", {"url": "http://github.com/Zane/Astra"}, "None", {"url": "."}],
             "skills": ["Bad Apple", {"url": "https://github.com/Zane/BadApple.git"}, {"name": "Other", "url": "https://example.com/m.json"}]}
@@ -64,4 +64,13 @@ with tempfile.TemporaryDirectory() as tmp:
     del MANIFEST["skills"]
     mirror.refresh(now=3702 + FULL_REFRESH)
     assert mirror.get("Zane", "BadApple", True) is None and mirror.get("Zane", "Astra", True)
+
+# The GitHub token goes to GitHub's API and nowhere else.
+with tempfile.TemporaryDirectory() as tmp:
+    token = Path(tmp) / "github-token"
+    assert "Authorization" not in store_headers("https://api.github.com/repos/a/b", token), "no token file: logged out"
+    token.write_text("abc123\n")
+    assert store_headers("https://api.github.com/repos/a/b", token)["Authorization"] == "Bearer abc123"
+    for other in ("https://github.com/a/b/releases/latest", "https://store.5x1.com/manifest.json", "https://api.github.com.evil.test/x"):
+        assert "Authorization" not in store_headers(other, token), other
 print("PASS store mirror")

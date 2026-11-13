@@ -622,10 +622,24 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def store_headers(url: str, token_file: Path | None = None) -> dict[str, str]:
+    """GitHub's API gets the token in updates/keys/github-token when there is one (5,000 requests an hour
+    instead of 60). Nothing else does: github.com and the Store's own list never see it."""
+    headers = {"User-Agent": "BEaker-Store", "Accept": "application/json, */*"}
+    if url.startswith("https://api.github.com/"):
+        try:
+            token = (token_file or ROOT / "updates" / "keys" / "github-token").read_text().strip()
+        except OSError:
+            token = ""
+        if token:
+            headers["Authorization"] = "Bearer " + token
+    return headers
+
+
 def store_fetch(url: str, follow: bool = True) -> tuple[int, dict[str, str], bytes]:
     """GET url; returns (status, headers, body) for any status."""
     opener = build_opener() if follow else build_opener(_NoRedirect)
-    req = Request(url, headers={"User-Agent": "BEaker-Store", "Accept": "application/json, */*"})
+    req = Request(url, headers=store_headers(url))
     try:
         with opener.open(req, timeout=30) as res:
             return res.status, dict(res.headers), res.read(2 * 1024 * 1024)
