@@ -622,6 +622,16 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
+# eBay's Marketplace Account Deletion endpoint, required for buy.jiborevival.com's eBay API keys. We keep no eBay
+# user data, so notifications are only acknowledged. The token is the one entered in eBay's developer portal.
+EBAY_DELETION_PATH = "/ebay/account-deletion"
+EBAY_DELETION_URL = "https://joap.5x1.com" + EBAY_DELETION_PATH  # must equal the URL registered with eBay
+
+
+def ebay_challenge_response(code: str, token: str, endpoint: str = EBAY_DELETION_URL) -> str:
+    return hashlib.sha256((code + token + endpoint).encode("utf-8")).hexdigest()
+
+
 def store_headers(url: str, token_file: Path | None = None) -> dict[str, str]:
     """GitHub's API gets the token in updates/keys/github-token when there is one (5,000 requests an hour
     instead of 60). Nothing else does: github.com and the Store's own list never see it."""
@@ -1109,10 +1119,11 @@ class Handler(BaseHTTPRequestHandler):
         extra_headers: dict | None = None,
         *,
         head_only: bool = False,
+        content_type: str = "application/x-amz-json-1.1",
     ) -> None:
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/x-amz-json-1.1")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         if extra_headers:
             for k, v in extra_headers.items():
@@ -1299,6 +1310,19 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == EBAY_DELETION_PATH:
+            code = parse_qs(parsed.query).get("challenge_code", [""])[0]
+            try:
+                token = (ROOT / "updates" / "keys" / "ebay-verification-token").read_text().strip()
+            except OSError:
+                token = ""
+            if not code or not token:
+                self._send_error_json(404, "NotFound", "no challenge_code or no token")
+                return
+            log_line("eBay account-deletion endpoint verified")
+            self._send_json(200, {"challengeResponse": ebay_challenge_response(code, token)}, content_type="application/json")
+            return
+
         # BEacon's Store: GitHub's repository / latest-release answers for 5x1 Store entries (store_mirror.py).
         store = re.fullmatch(r"/store/repos/([^/]+)/([^/]+)(/releases/latest)?", path)
         if store:
@@ -1426,6 +1450,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         body = self._read_body()
+        if urlparse(self.path).path == EBAY_DELETION_PATH:  # eBay's signed notice, not a robot call
+            log_line(f"eBay account-deletion notice bytes={len(body)}")
+            self.send_response(204)
+            self.end_headers()
+            return
         if not self._check_auth(body):
             return
 
