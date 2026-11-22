@@ -687,6 +687,28 @@ def _trim_release(data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# A Store star counts only from a robot that behaves like one here: BEaker has its serial (robots send it),
+# first saw it a week ago, and saw it in the last two days (robots check in many times a day). Its first star
+# pins its name, so one key can't star as different robots.
+STORE_VOTER_MIN_AGE_MS = 7 * 24 * 3600 * 1000
+STORE_VOTER_MAX_IDLE_MS = 2 * 24 * 3600 * 1000
+
+
+def store_voter_problem(profile: dict[str, Any] | None, name: str, now_ms: int) -> str | None:
+    """Why this robot may not star (None = it may, if BEefy also agrees)."""
+    if not name:
+        return "no robot name"
+    if not profile or not profile.get("serial"):
+        return "no serial seen from this robot"
+    if now_ms - int(profile.get("firstSeen") or now_ms) < STORE_VOTER_MIN_AGE_MS:
+        return "first seen less than 7 days ago"
+    if now_ms - int(profile.get("lastSeen") or 0) > STORE_VOTER_MAX_IDLE_MS:
+        return "not seen in the last 2 days"
+    if profile.get("storeName") and profile["storeName"] != name:
+        return f"name changed from {profile['storeName']!r}"
+    return None
+
+
 class StoreMirror:
     def __init__(self, path: Path, fetcher: Callable[..., tuple[int, dict[str, str], bytes]] = store_fetch,
                  manifest_url: str = STORE_MANIFEST_URL) -> None:
@@ -718,9 +740,9 @@ class StoreMirror:
             # Every client reads stargazers_count, so BEacon votes count as stars there (old robots included).
             return dict(data, stargazers_count=(data.get("stargazers_count") or 0) + len(self.votes.get(name, [])))
 
-    def vote(self, robot_id: str, repo: str, starred: bool) -> int | None:
-        """One star per robot; returns the new count, or None for a repository outside the Store."""
-        name, voter = repo.lower(), hashlib.sha256(robot_id.encode("utf-8")).hexdigest()
+    def vote(self, robot: str, repo: str, starred: bool) -> int | None:
+        """One star per robot (its name, as BEefy knows it); returns the new count, or None outside the Store."""
+        name, voter = repo.lower(), hashlib.sha256(robot.encode("utf-8")).hexdigest()
         with self.lock:
             if name not in self.repos:
                 return None
@@ -1275,8 +1297,8 @@ class Handler(BaseHTTPRequestHandler):
         pkg, digest = resolved
         self._send_file(pkg, etag=digest, no_store=True, head_only=head_only)
 
-    def _forward_to_beefy(self, body: bytes) -> None:
-        """BEacon's personal-report calendar settings live in BEefy; robots only know this endpoint."""
+    def _post_beefy(self, body: bytes) -> tuple[int, bytes] | None:
+        """This robot request, passed on to BEefy unchanged; None when BEefy can't be reached."""
         headers = self._headers_lower()
         keep = {k: headers[k] for k in ("x-amz-target", "x-amz-date", "authorization", "x-jibo-robotid", "content-type") if headers.get(k)}
         url = os.environ.get("BEAKER_BEEFY_URL", "https://api.5x1.com/")
@@ -1286,10 +1308,18 @@ class Handler(BaseHTTPRequestHandler):
         except HTTPError as err:
             status, data = err.code, err.read()
         except (URLError, OSError) as err:
-            log_line(f"calendar forward failed: {err}")
+            log_line(f"BEefy forward of {keep.get('x-amz-target')} failed: {err}")
+            return None
+        log_line(f"forwarded {keep.get('x-amz-target')} to BEefy -> {status}")
+        return status, data
+
+    def _forward_to_beefy(self, body: bytes) -> None:
+        """BEacon's personal-report calendar settings live in BEefy; robots only know this endpoint."""
+        got = self._post_beefy(body)
+        if got is None:
             self._send_json(502, {"error": "Could not reach the 5x1 calendar service."})
             return
-        log_line(f"forwarded {keep.get('x-amz-target')} to BEefy -> {status}")
+        status, data = got
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -1643,18 +1673,29 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {})
             return
         if op == "StoreVote":
-            # BEacon's Store star; the voter is the robot's access key (not verified while require_auth is off).
+            # BEacon's Store star. Counted only for a robot that acts like one here (store_voter_problem) and that
+            # BEefy agrees has really been talking to 5x1 (it forwards this same request); one star per robot name.
             repo, starred = payload.get("repo"), payload.get("starred")
+            name = self._headers_lower().get("x-jibo-robotid", "").strip()
             if not robot_id:
                 self._send_error_json(401, "AuthFailure", "missing robot access key in Authorization Credential=")
             elif not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}", repo) or not isinstance(starred, bool):
                 self._send_error_json(400, "ValidationException", "repo (owner/name) and starred (true/false) required")
+            elif self.store.get(*repo.split("/"), False) is None:
+                self._send_error_json(404, "NotFound", "not in the 5x1 Store")
             else:
-                stars = self.store.vote(robot_id, repo, starred)
-                if stars is None:
-                    self._send_error_json(404, "NotFound", "not in the 5x1 Store")
+                problem = store_voter_problem(self.robots.get(robot_id), name, int(time.time() * 1000))
+                if problem is None:
+                    got = self._post_beefy(body)
+                    verified = got is not None and got[0] == 200 and (json.loads(got[1] or b"{}") or {}).get("verified") is True
+                    problem = None if verified else "BEefy did not verify it" + (f" (HTTP {got[0]})" if got else " (unreachable)")
+                if problem:
+                    log_line(f"Store vote refused robot={robot_id!r} name={name!r} repo={repo!r}: {problem}")
+                    self._send_json(403, {"__type": "Forbidden", "error": "Unable to star", "message": "Unable to star"})
                 else:
-                    log_line(f"Store vote robot={robot_id!r} repo={repo!r} starred={starred} -> {stars}")
+                    self.robots.touch(robot_id, storeName=name)
+                    stars = self.store.vote(name, repo, starred)
+                    log_line(f"Store vote robot={robot_id!r} name={name!r} repo={repo!r} starred={starred} -> {stars}")
                     self._send_json(200, {"repo": repo.lower(), "starred": starred, "stars": stars})
             return
         if op == "GetUpdateFrom":
