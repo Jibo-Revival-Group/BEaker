@@ -73,4 +73,52 @@ with tempfile.TemporaryDirectory() as tmp:
     assert store_headers("https://api.github.com/repos/a/b", token)["Authorization"] == "Bearer abc123"
     for other in ("https://github.com/a/b/releases/latest", "https://store.5x1.com/manifest.json", "https://api.github.com.evil.test/x"):
         assert "Authorization" not in store_headers(other, token), other
+
+# BEacon votes: one per robot, added to GitHub's star count; only for repositories in the Store.
+with tempfile.TemporaryDirectory() as tmp:
+    MANIFEST["skills"] = ["Bad Apple", {"url": "https://github.com/Zane/BadApple.git"}]
+    mirror = StoreMirror(Path(tmp) / "store-mirror.json", fetch)
+    mirror.refresh(now=1000)
+    assert mirror.vote("robot-a", "Zane/Astra", True) == 43
+    assert mirror.vote("robot-a", "zane/astra", True) == 43, "a robot votes once"
+    assert mirror.vote("robot-b", "zane/astra", True) == 44
+    assert mirror.get("Zane", "Astra", False)["stargazers_count"] == 44
+    assert mirror.get("Zane", "BadApple", False)["stargazers_count"] == 42
+    assert mirror.vote("robot-a", "zane/astra", False) == 43
+    assert mirror.vote("robot-a", "someone/else", True) is None, "not in the Store"
+    saved = (Path(tmp) / "store-votes.json").read_text()
+    assert "robot-b" not in saved, "robot keys are stored hashed"
+    assert StoreMirror(Path(tmp) / "store-mirror.json", fetch).get("zane", "astra", False)["stargazers_count"] == 43, "votes survive a restart"
+    mirror.refresh(now=2000)
+    assert mirror.get("Zane", "Astra", False)["stargazers_count"] == 43, "a refresh keeps the votes"
+
+# Files from Store repositories (README, banner, ...): cached, 404s too; nothing outside the Store; old copy on errors.
+raw_calls: list[str] = []
+raw_status = 200
+
+
+def raw_fetch(url: str, follow: bool = True):
+    if url.startswith("https://raw.githubusercontent.com/"):
+        raw_calls.append(url)
+        if url.endswith("missing.png"):
+            return 404, {}, b""
+        return raw_status, {}, b"# Astra" if raw_status == 200 else b""
+    return fetch(url, follow)
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    MANIFEST["skills"] = [{"name": "No release", "url": "https://github.com/Zane/NoRelease"}]
+    tags["zane/norelease"] = None
+    mirror = StoreMirror(Path(tmp) / "store-mirror.json", raw_fetch)
+    assert mirror.raw("Zane", "Astra", "HEAD", "README.md") is None, "nothing before the Store list is read"
+    mirror.refresh(now=1000)
+    assert json.loads(mirror.manifest) == MANIFEST, "the Store list itself is served"
+    assert mirror.raw("Zane", "Astra", "HEAD", "README.md", now=1000) == (200, b"# Astra")
+    assert mirror.raw("zane", "astra", "HEAD", "README.md", now=1100) == (200, b"# Astra") and len(raw_calls) == 1, "cached"
+    assert mirror.raw("Zane", "Astra", "HEAD", "missing.png", now=1100) == (404, b"")
+    assert mirror.raw("Zane", "NoRelease", "HEAD", "README.md", now=1100)[0] == 200, "repositories without a release too"
+    assert mirror.raw("someone", "else", "HEAD", "README.md") is None, "only repositories in the Store"
+    raw_status = 500
+    assert mirror.raw("Zane", "Astra", "HEAD", "README.md", now=1000 + 3600) == (200, b"# Astra"), "GitHub down: old copy"
+    assert StoreMirror(Path(tmp) / "store-mirror.json", raw_fetch).manifest == mirror.manifest, "the list survives a restart"
 print("PASS store mirror")

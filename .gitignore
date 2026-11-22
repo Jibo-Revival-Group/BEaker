@@ -24,3 +24,4 @@ updates/keys/
 *.swp
 *~
 updates/store-mirror.json
+updates/store-votes.json

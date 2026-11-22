@@ -33,6 +33,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -45,7 +46,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 ROOT = Path(__file__).resolve().parent
@@ -157,8 +158,11 @@ def reload_allowed(peer_ip: str) -> bool:
 
 
 def extract_access_key(headers: dict[str, str]) -> str | None:
-    """Pull the robot account id from SigV4 Authorization Credential=..."""
+    """Pull the robot account id from SigV4 Authorization Credential=..., or BEacon's AWS3 AWSAccessKeyId=..."""
     auth = headers.get("authorization", "")
+    if auth.startswith("AWS3 "):
+        found = re.search(r"AWSAccessKeyId=([^,\s]+)", auth)
+        return found.group(1) if found else None
     if not auth.startswith("AWS4-HMAC-SHA256 "):
         return None
     for piece in auth[len("AWS4-HMAC-SHA256 ") :].split(","):
@@ -614,6 +618,9 @@ def version_key(v: str) -> tuple:
 STORE_MANIFEST_URL = "https://store.5x1.com/manifest.json"
 STORE_INTERVAL = 15 * 60
 STORE_FULL_REFRESH = 24 * 3600  # shortcut: a release edited under the same tag shows up within a day, not 15 minutes
+STORE_RAW_TTL = 15 * 60
+STORE_MAX_FILE = 8 * 1024 * 1024  # biggest README/banner/manifest BEaker passes on
+STORE_RAW_CACHE = 64 * 1024 * 1024  # bytes of README/banner/manifest copies kept in memory
 STORE_REPO_URL = re.compile(r"^https?://github\.com/([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100}?)(?:\.git)?/?$", re.I)
 
 
@@ -652,7 +659,7 @@ def store_fetch(url: str, follow: bool = True) -> tuple[int, dict[str, str], byt
     req = Request(url, headers=store_headers(url))
     try:
         with opener.open(req, timeout=30) as res:
-            return res.status, dict(res.headers), res.read(2 * 1024 * 1024)
+            return res.status, dict(res.headers), res.read(STORE_MAX_FILE + 1)
     except HTTPError as err:
         return err.code, dict(err.headers or {}), b""
 
@@ -684,16 +691,74 @@ class StoreMirror:
     def __init__(self, path: Path, fetcher: Callable[..., tuple[int, dict[str, str], bytes]] = store_fetch,
                  manifest_url: str = STORE_MANIFEST_URL) -> None:
         self.path, self.fetch, self.manifest_url = path, fetcher, manifest_url
+        self.votes_path = path.with_name("store-votes.json")
         self.lock = threading.Lock()
         try:
-            self.repos: dict[str, dict[str, Any]] = json.loads(path.read_text())["repos"]
+            saved = json.loads(path.read_text())
+            self.repos: dict[str, dict[str, Any]] = saved["repos"]
         except (OSError, ValueError, KeyError, TypeError):
-            self.repos = {}
+            saved, self.repos = {}, {}
+        # The Store's list itself, and every repository on it (with or without a release), for /store/raw.
+        self.manifest: str | None = saved.get("manifest") if isinstance(saved.get("manifest"), str) else None
+        self.listed: set[str] = set(store_repositories(json.loads(self.manifest))) if self.manifest else set()
+        self.raw_cache: dict[str, tuple[float, int, bytes]] = {}
+        # BEacon stars ("votes"): repo -> hashed robot access keys. Kept apart from the copy, which refresh rewrites.
+        try:
+            self.votes: dict[str, list[str]] = json.loads(self.votes_path.read_text())
+        except (OSError, ValueError):
+            self.votes = {}
 
     def get(self, owner: str, repo: str, release: bool) -> dict[str, Any] | None:
+        name = (owner + "/" + repo).lower()
         with self.lock:
-            entry = self.repos.get((owner + "/" + repo).lower())
-        return (entry or {}).get("release" if release else "repo")
+            entry = self.repos.get(name)
+            data = (entry or {}).get("release" if release else "repo")
+            if data is None or release:
+                return data
+            # Every client reads stargazers_count, so BEacon votes count as stars there (old robots included).
+            return dict(data, stargazers_count=(data.get("stargazers_count") or 0) + len(self.votes.get(name, [])))
+
+    def vote(self, robot_id: str, repo: str, starred: bool) -> int | None:
+        """One star per robot; returns the new count, or None for a repository outside the Store."""
+        name, voter = repo.lower(), hashlib.sha256(robot_id.encode("utf-8")).hexdigest()
+        with self.lock:
+            if name not in self.repos:
+                return None
+            voters = [v for v in self.votes.get(name, []) if v != voter] + ([voter] if starred else [])
+            self.votes[name] = voters
+            text = json.dumps(self.votes)
+            tmp = self.votes_path.with_suffix(".tmp")
+            tmp.write_text(text)
+            tmp.replace(self.votes_path)
+        owner, _, short = name.partition("/")
+        return self.get(owner, short, False)["stargazers_count"]
+
+    def raw(self, owner: str, repo: str, ref: str, file: str, now: float | None = None) -> tuple[int, bytes] | None:
+        """A file from a Store repository (README, manifest, banner, README images), cached for STORE_RAW_TTL.
+        None for repositories outside the Store. Packages are not fetched through here."""
+        name = (owner + "/" + repo).lower()
+        if name not in self.listed:
+            return None
+        now = time.time() if now is None else now
+        url = f"https://raw.githubusercontent.com/{quote(owner)}/{quote(repo)}/{quote(ref)}/{quote(file)}"
+        key = f"{name}/{ref}/{file}"  # GitHub ignores owner/repo case
+        with self.lock:
+            hit = self.raw_cache.get(key)
+        if hit and now - hit[0] < STORE_RAW_TTL:
+            return hit[1], hit[2]
+        status, _, body = self.fetch(url)
+        if status == 200 and len(body) > STORE_MAX_FILE:
+            return 413, b""
+        if status not in (200, 404):
+            return (hit[1], hit[2]) if hit else (502, b"")  # GitHub trouble: serve the old copy if there is one
+        body = body if status == 200 else b""
+        with self.lock:
+            self.raw_cache.pop(key, None)
+            self.raw_cache[key] = (now, status, body)
+            # Bounded: drop the oldest copies past STORE_RAW_CACHE bytes.
+            while sum(len(v[2]) for v in self.raw_cache.values()) > STORE_RAW_CACHE and len(self.raw_cache) > 1:
+                self.raw_cache.pop(next(iter(self.raw_cache)))
+        return status, body
 
     def refresh(self, now: float | None = None) -> dict[str, int]:
         """One pass. Keeps the old copy of anything it cannot refresh."""
@@ -702,7 +767,8 @@ class StoreMirror:
         status, _, body = self.fetch(self.manifest_url)
         if status != 200:
             raise RuntimeError(f"store manifest returned HTTP {status}")
-        names = store_repositories(json.loads(body))
+        manifest = body.decode("utf-8")
+        names = store_repositories(json.loads(manifest))
         stats["listed"] = len(names)
         limited = False
         for name in names:
@@ -732,7 +798,8 @@ class StoreMirror:
         with self.lock:
             # Repositories taken off the Store's list stop being served.
             self.repos = {name: self.repos[name] for name in names if name in self.repos}
-            text = json.dumps({"repos": self.repos}, indent=1)
+            self.manifest, self.listed = manifest, set(names)
+            text = json.dumps({"repos": self.repos, "manifest": manifest}, indent=1)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(text)
         tmp.replace(self.path)
@@ -1057,6 +1124,15 @@ class Handler(BaseHTTPRequestHandler):
             extras["loopId"] = str(loop_id)
         return self.robots.touch(robot_id, **extras)
 
+    def _send_bytes(self, status: int, data: bytes, content_type: str, extra_headers: dict | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
     def _send_file(
         self,
         path: Path,
@@ -1323,14 +1399,34 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"challengeResponse": ebay_challenge_response(code, token)}, content_type="application/json")
             return
 
-        # BEacon's Store: GitHub's repository / latest-release answers for 5x1 Store entries (store_mirror.py).
+        # Everything the Store shows except packages: its list, and files from the repositories on it.
+        cors = {"Access-Control-Allow-Origin": "*"}  # public data; the web store reads it from the browser
+        if path == "/store/manifest.json":
+            if self.store.manifest is None:
+                self._send_json(503, {"__type": "Unavailable", "message": "the Store list has not been fetched yet"}, cors)
+            else:
+                self._send_bytes(200, self.store.manifest.encode("utf-8"), "application/json", cors)
+            return
+        raw = re.fullmatch(r"/store/raw/([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})/([A-Za-z0-9._-]{1,100})/((?:[A-Za-z0-9._ ()-]+/)*[A-Za-z0-9._ ()-]+)", path)
+        if raw and ".." not in raw.group(4).split("/"):
+            got = self.store.raw(*raw.groups())
+            if got is None:
+                self._send_json(404, {"__type": "NotFound", "message": "not in the 5x1 Store"}, cors)
+            else:
+                kind = mimetypes.guess_type(raw.group(4))[0] or "text/plain"
+                # Files come from anyone's repository: never let one run as a page on this origin.
+                self._send_bytes(got[0], got[1], "text/plain; charset=utf-8" if kind.startswith("text/") or kind.endswith("json") else kind,
+                                 dict(cors, **{"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox; default-src 'none'"}))
+            return
+        # The Store's repository / latest-release answers (with BEacon votes), for BEacon and store.5x1.com's pages.
         store = re.fullmatch(r"/store/repos/([^/]+)/([^/]+)(/releases/latest)?", path)
         if store:
             data = self.store.get(store.group(1), store.group(2), bool(store.group(3)))
             if data is None:
-                self._send_error_json(404, "NotFound", "not in the 5x1 Store")
+                self._send_json(404, {"__type": "NotFound", "code": "NotFound", "message": "not in the 5x1 Store"},
+                                dict(cors, **{"x-amzn-errortype": "NotFound"}))
             else:
-                self._send_json(200, data)
+                self._send_json(200, data, cors)
             return
 
         if path.startswith("/packages/"):
@@ -1545,6 +1641,21 @@ class Handler(BaseHTTPRequestHandler):
         ):
             log_line(f"Log.{op} robot={robot_id!r} keys={list(payload.keys())}")
             self._send_json(200, {})
+            return
+        if op == "StoreVote":
+            # BEacon's Store star; the voter is the robot's access key (not verified while require_auth is off).
+            repo, starred = payload.get("repo"), payload.get("starred")
+            if not robot_id:
+                self._send_error_json(401, "AuthFailure", "missing robot access key in Authorization Credential=")
+            elif not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}", repo) or not isinstance(starred, bool):
+                self._send_error_json(400, "ValidationException", "repo (owner/name) and starred (true/false) required")
+            else:
+                stars = self.store.vote(robot_id, repo, starred)
+                if stars is None:
+                    self._send_error_json(404, "NotFound", "not in the 5x1 Store")
+                else:
+                    log_line(f"Store vote robot={robot_id!r} repo={repo!r} starred={starred} -> {stars}")
+                    self._send_json(200, {"repo": repo.lower(), "starred": starred, "stars": stars})
             return
         if op == "GetUpdateFrom":
             self._get_update_from(payload)
