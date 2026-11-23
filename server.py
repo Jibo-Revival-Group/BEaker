@@ -1297,6 +1297,27 @@ class Handler(BaseHTTPRequestHandler):
         pkg, digest = resolved
         self._send_file(pkg, etag=digest, no_store=True, head_only=head_only)
 
+    def _discard_upload(self) -> None:
+        """A robot log upload (see Log_ above): read it to the end and drop it."""
+        try:
+            left = int(self.headers.get("Content-Length") or "")
+        except ValueError:
+            self.close_connection = True
+            self.send_error(411, "length required")
+            return
+        if left < 0 or left > 256 * 1024 * 1024:
+            self.close_connection = True
+            self.send_error(413, "too large")
+            return
+        while left > 0:
+            chunk = self.rfile.read(min(left, 65536))
+            if not chunk:
+                break
+            left -= len(chunk)
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _post_beefy(self, body: bytes) -> tuple[int, bytes] | None:
         """This robot request, passed on to BEefy unchanged; None when BEefy can't be reached."""
         headers = self._headers_lower()
@@ -1525,6 +1546,9 @@ class Handler(BaseHTTPRequestHandler):
         # Body is MD5'd then discarded — never written to disk.
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
+        if path == "/logs/discard":
+            self._discard_upload()
+            return
         if not path.startswith("/backups/"):
             self.send_error(404, "not found")
             return
@@ -1670,7 +1694,11 @@ class Handler(BaseHTTPRequestHandler):
             "PutAsrBinary",
         ):
             log_line(f"Log.{op} robot={robot_id!r} keys={list(payload.keys())}")
-            self._send_json(200, {})
+            # The robot's log client crashes without an uploadUrl for the *Async calls, and that crash made logrotate skip
+            # every rotation until /tmp (64 MB RAM) filled and Jibo stopped. Give it one that accepts and discards the
+            # upload (no robot logs are kept). It always uploads over https to the URL's host:port, so no :80 here.
+            host = urlparse(self.config["public_base_url"]).hostname or "joap.5x1.com"
+            self._send_json(200, {"uploadUrl": f"https://{host}/logs/discard"} if op.endswith("Async") or op == "PutAsrBinary" else {})
             return
         if op == "StoreVote":
             # BEacon's Store star. Counted only for a robot that acts like one here (store_voter_problem) and that
