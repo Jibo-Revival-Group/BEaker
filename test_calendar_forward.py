@@ -71,6 +71,8 @@ def main() -> None:
         count = len(seen)
         post(port, "Loop_20160324.ListLoops", {})
         assert len(seen) == count, "other Loop targets stay local"
+        assert post(port, "Loop_20160324.SuspendLoop", {"loopId": "l"}) == (200, {"result": "ok"}), "factory reset suspends the loop"
+        assert len(seen) == count
         fake.shutdown(); fake.server_close()
         status, data = post(port, "Loop_20160324.TestCalendarFeed", {"memberId": "m"})
         assert status == 502 and "calendar" in data["error"], (status, data)

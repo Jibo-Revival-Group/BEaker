@@ -1677,6 +1677,12 @@ class Handler(BaseHTTPRequestHandler):
             if op == "GetRobot":
                 self._loop_get_robot(payload)
                 return
+            if op == "SuspendLoop":
+                # Factory reset (WipeUtil) suspends the loop first and gives up, back in normal mode, on any error.
+                # Jibo's loop lives on the robot and BEefy, so there is nothing to suspend here; answer like BEefy.
+                log_line(f"Loop.SuspendLoop robot={robot_id!r} (factory reset)")
+                self._send_json(200, {"result": "ok"})
+                return
         if prefix.startswith("Robot_") and op == "GetRobot":
             self._robot_get(payload)
             return
