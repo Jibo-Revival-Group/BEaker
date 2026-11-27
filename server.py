@@ -862,7 +862,9 @@ class Catalog:
                 length = pkg_path.stat().st_size
                 hash_cache[pkg_name] = (digest, length)
             digest, length = hash_cache[pkg_name]
-            uid = entry.get("_id") or pkg_path.stem
+            # The robot's system manager keeps offers by id and never refreshes a known one, so a
+            # republished package needs a new id or robots keep its old URL/shaHash until reboot.
+            uid = f'{entry.get("_id") or pkg_path.stem}-{digest[:12]}'
             record = {
                 "_id": uid,
                 "created": entry.get("created", int(time.time() * 1000)),

@@ -26,7 +26,7 @@ def main() -> None:
         for automatic in ("fcs", "eau"):  # robots' own update checks must never see the os row
             assert catalog.get_from(subsystem="os", from_version="1.9.1", filt=automatic) is None
         services = catalog.get_from(subsystem="services", from_version="3.3.2", filt="oobe")
-        assert services and services["_id"] == "stock-services-oobe", services
+        assert services and services["_id"].startswith("stock-services-oobe-"), services
         for automatic in ("fcs", "eau"):  # robots' own checks still get BEnch, never stock services
             offer = catalog.get_from(subsystem="services", from_version="3.3.2", filt=automatic)
             assert offer and offer["_id"].startswith("bench-services"), offer
